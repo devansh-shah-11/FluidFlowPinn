@@ -1,0 +1,73 @@
+# ── Fluid-Flow PINN — Default Configuration ──────────────────────────────────
+
+# Data paths (relative to repo root)
+data:
+  root: data/
+  fdst: data/fdst/
+  umn: data/umn/
+  shanghaitech: data/shanghaitech/
+  crowdflow: data/crowdflow/
+  venice: data/venice/
+  mall: data/mall/
+  ucsd: data/ucsd/
+
+# Output paths
+output:
+  checkpoints: checkpoints/
+  visualizations: outputs/
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  csrnet_weights: null          # path to local .pth, or null to download
+  raft_weights: null            # path to local .pth, or null to download
+  pressure_window: 5            # local spatial window (px) for Var(u) in Branch 3
+  use_fp16: true
+  grad_checkpoint: true         # gradient checkpointing on shared backbone
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs: 100
+  batch_size: 4                 # max for T4 with FP16
+  num_workers: 4
+  seed: 42
+
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+  scheduler: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+
+  # Loss weights
+  lambda1: 0.1                  # motion (EPE) loss weight
+  lambda2: 0.01                 # physics (continuity) loss weight
+
+  # Checkpointing
+  save_every: 1                 # save checkpoint every N epochs
+  keep_top_k: 3                 # keep only the K best checkpoints
+
+  # Optional W&B logging (set to null to disable)
+  wandb_project: null
+  wandb_entity: null
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  pressure_threshold: 0.5       # P > threshold triggers risk alert
+  lead_time_target: 5.0         # seconds before visible panic onset (goal)
+
+# ── Data / Preprocessing ──────────────────────────────────────────────────────
+preprocessing:
+  fps: 30                       # video frame rate (used for ∂ρ/∂t = Δρ / (1/fps))
+  target_height: 480            # UMN bicubic upsample target
+  target_width: 640             # UMN bicubic upsample target
+
+  # Input normalisation (ImageNet stats — applied before CSRNet and RAFT)
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+  # UMN scene frame indices (inclusive start, exclusive end)
+  umn_scenes:
+    scene1: [0, 641]
+    scene2: [641, 1001]
+    scene3: [1001, -1]           # -1 means to end of file
