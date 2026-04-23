@@ -37,8 +37,14 @@ class RAFTFlow(nn.Module):
         img1 = self._denorm(frame_t)
         img2 = self._denorm(frame_t1)
 
+        pad_h = (8 - H % 8) % 8
+        pad_w = (8 - W % 8) % 8
+        if pad_h or pad_w:
+            img1 = F.pad(img1, (0, pad_w, 0, pad_h))
+            img2 = F.pad(img2, (0, pad_w, 0, pad_h))
+
         flow_predictions = self.raft(img1, img2, num_flow_updates=self.num_flow_updates)
-        flow = flow_predictions[-1]  # (B, 2, H, W)
+        flow = flow_predictions[-1][:, :, :H, :W]  # crop padding, (B, 2, H, W)
 
         Hd, Wd = H // 8, W // 8
         u = F.interpolate(flow, size=(Hd, Wd), mode="bilinear", align_corners=False)
