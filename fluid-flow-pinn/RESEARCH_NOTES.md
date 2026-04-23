@@ -13,6 +13,7 @@
 4. [Phase 1 — Perception](#4-phase-1--perception)
    - [Step 2: Preprocessing & Data Pipeline](#step-2-preprocessing--data-pipeline)
    - [Step 3: Branch 1 — CSRNet Density](#step-3-branch-1--csrnet-density)
+   - [Step 4: Branch 2 — RAFT Optical Flow](#step-4-branch-2--raft-optical-flow)
 5. [Datasets](#5-datasets)
 6. [Design Decisions Log](#6-design-decisions-log)
 7. [Open Questions](#7-open-questions)
@@ -177,6 +178,42 @@ For FDST frames (1080×1920): output is `(B, 1, 135, 240)` — matches the groun
 
 ---
 
+### Step 4: Branch 2 — RAFT Optical Flow
+
+**File:** `models/branch2_flow.py`
+
+#### What we built
+
+`RAFTFlow` — a PyTorch `nn.Module` that takes consecutive frame pairs `(frame_t, frame_t1)` at `(B, 3, H, W)` and outputs a velocity field `u = (ux, uy)` at `(B, 2, H/8, W/8)`.
+
+#### Architecture details
+
+**Why RAFT-Small (not RAFT-Large)?**
+RAFT-Large requires ~5× more VRAM. At 1080×1920 inputs on a T4 (16 GB), running Large alongside CSRNet would OOM. RAFT-Small achieves ~1.5 px EPE on Sintel Clean — sufficient for crowd motion where displacements are typically 5–30 px/frame.
+
+**Why frozen weights?**
+FDST has no optical-flow ground truth. End-to-end fine-tuning would need `L_motion` from CrowdFlow (a small synthetic set), risking catastrophic forgetting of pretrained flow quality. Freezing produces reliable velocity estimates from day one. `set_trainable(True)` can be called if CrowdFlow GT is used.
+
+**Why downsample flow to H/8?**
+The physics loss `∂ρ/∂t + ∇·(ρu)` requires `ρ` and `u` on the same spatial grid. CSRNet outputs `ρ` at H/8 × W/8, so RAFT's full-resolution flow is bilinear-downsampled to match. Flow magnitudes are also scaled by 1/8 to keep units consistent at the coarse grid.
+
+**ImageNet denormalisation:**
+RAFT expects pixel values in [0, 255]. Our pipeline normalises frames to ImageNet mean/std, so the wrapper undoes this before calling RAFT and re-applies inside the forward pass transparently.
+
+**`num_flow_updates = 12`:**
+RAFT uses a recurrent GRU to iteratively refine the flow estimate. 12 iterations is the RAFT paper default for RAFT-Small. Fewer iterations trade accuracy for speed (useful for inference-time ablations).
+
+#### Output
+
+```
+Input:  frame_t, frame_t1  — (B, 3, H, W)  ImageNet-normalised RGB
+Output: u                  — (B, 2, H/8, W/8)  (ux, uy) in pixels/frame at coarse grid
+```
+
+For FDST frames (1080×1920): output is `(B, 2, 135, 240)` — matches the CSRNet density map grid for the physics loss.
+
+---
+
 ## 5. Datasets
 
 | Dataset | Role | Split | Status |
@@ -208,6 +245,9 @@ FDST Dataset/
 | CSRNet for density | MCNN, DM-Count, BayesCrowd | CSRNet is the reference model in the crowd crushing literature; lightest that still achieves SOTA MAE |
 | VGG-16 frontend | ResNet-50, MobileNet | CSRNet paper uses VGG-16; changing backbone would invalidate pretrained CSRNet weight compatibility |
 | RAFT for optical flow | Farneback (classical), FlowNet | RAFT is current SOTA learned flow; far more accurate on crowd motion than classical methods |
+| RAFT-Small (not Large) | RAFT-Large | RAFT-Large would OOM on T4 alongside CSRNet at 1080×1920; Small is accurate enough for crowd motion (~5–30 px/frame displacements) |
+| RAFT frozen by default | End-to-end fine-tuning | FDST has no flow GT; freezing avoids catastrophic forgetting; `set_trainable(True)` unlocks fine-tuning on CrowdFlow |
+| Flow scaled by 1/8 after downsample | Keep raw pixel values | Downsampled flow represents motion at the coarse grid — dividing by 8 keeps units consistent with the density-grid pixel spacing |
 | Continuity equation as physics loss | Momentum equation, energy equation | Continuity only requires `ρ` and `u` — no pressure terms needed as input, making it self-contained |
 | σ=15 px Gaussian smoothing | Adaptive σ (geometry-aware), σ=4 | σ=15 is the CSRNet paper value for similar-scale datasets; geometry-aware requires camera calibration we don't have |
 | 1/8 density resolution | 1/4, full resolution | 1/8 is the natural VGG-16 frontend output stride; going finer requires extra upsampling that adds noise |
