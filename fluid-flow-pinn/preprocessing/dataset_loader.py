@@ -144,7 +144,7 @@ class FDSTDataset(Dataset):
                 f"  {self.root / self.split}"
             )
 
-        for scene_dir in sorted(split_dir.iterdir(), key=lambda p: p.name):
+        for scene_dir in sorted(split_dir.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else p.name):
             if not scene_dir.is_dir():
                 continue
 
