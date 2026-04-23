@@ -3,8 +3,9 @@
 import os
 import json
 import glob
+import random
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import h5py
@@ -12,7 +13,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 
 # ── Default ImageNet normalisation ────────────────────────────────────────────
@@ -47,28 +48,71 @@ def _upsample_tensor(
     ).squeeze(0)
 
 
+# ── Scene-aware sampler ───────────────────────────────────────────────────────
+
+class SequentialSceneSampler(Sampler):
+    """Yields indices that preserve temporal order within each scene.
+
+    Scenes are shuffled between epochs (when shuffle=True), but frames
+    within each scene always appear in order. This satisfies the constraint:
+        "never shuffle frames independently — shuffle sequences, then
+         iterate within each sequence in order."
+
+    Usage:
+        sampler = SequentialSceneSampler(dataset, shuffle=True)
+        loader  = DataLoader(dataset, batch_size=4, sampler=sampler)
+
+    On each new epoch call `sampler.set_epoch(epoch)` to get a different
+    scene ordering (same API as DistributedSampler).
+    """
+
+    def __init__(self, dataset: "FDSTDataset", shuffle: bool = True) -> None:
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __iter__(self) -> Iterator[int]:
+        scene_names = list(self.dataset.scene_ranges.keys())
+        if self.shuffle:
+            rng = random.Random(self._epoch)
+            rng.shuffle(scene_names)
+        for scene in scene_names:
+            start, end = self.dataset.scene_ranges[scene]
+            yield from range(start, end)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+
 # ── FDST Dataset ──────────────────────────────────────────────────────────────
 
 class FDSTDataset(Dataset):
-    """Consecutive frame pairs from FDST video clips.
+    """Consecutive frame pairs from the FDST dataset.
 
-    FDST directory layout expected:
-        fdst/
-          train/  (or test/)
-            <scene_id>/
-              frames/   ← pre-extracted .jpg images named 0001.jpg …
-              GT_density/  ← density maps as .npy or .h5
+    Actual on-disk layout:
+        <root>/
+          train_data/
+            1/   2/   ...   ← scene dirs (numbered)
+              001.jpg  001.json
+              002.jpg  002.json
+              ...
+          test_data/
+            1/   2/   ...
 
-    If frames/ does not exist the dataset attempts to read directly from
-    video files using OpenCV (streaming — no full load into RAM).
+    Each JSON file contains head-point annotations used to build a
+    Gaussian-smoothed density map (sigma=15 px), downsampled to 1/8
+    resolution to match CSRNet output.
 
     Each __getitem__ returns:
         {
             'frame_t':      FloatTensor (3, H, W)   normalised RGB,
             'frame_t1':     FloatTensor (3, H, W)   normalised RGB,
-            'density_map':  FloatTensor (1, H/8, W/8) ground-truth density,
-            'scene':        str,
-            'idx':          int  (index of frame_t within its scene),
+            'density_map':  FloatTensor (1, H//8, W//8),
+            'scene':        str   (scene folder name),
+            'idx':          int   (frame index within scene),
         }
     """
 
@@ -77,111 +121,122 @@ class FDSTDataset(Dataset):
         root: str | Path,
         split: str = "train",
         transform: Optional[Callable] = None,
+        density_sigma: float = 15.0,
     ) -> None:
         self.root = Path(root)
         self.split = split
         self.transform = transform or _DEFAULT_TRANSFORM
+        self.density_sigma = density_sigma
         self._samples: List[Dict] = []
+        # Maps scene name → (start_idx, end_idx) in _samples (end exclusive)
+        self.scene_ranges: Dict[str, Tuple[int, int]] = {}
         self._build_index()
 
     def _build_index(self) -> None:
-        split_dir = self.root / self.split
+        # Support both "train_data" and "train" naming conventions
+        split_dir = self.root / f"{self.split}_data"
         if not split_dir.exists():
-            # Fallback: treat root itself as the split dir
-            split_dir = self.root
+            split_dir = self.root / self.split
+        if not split_dir.exists():
+            raise FileNotFoundError(
+                f"FDST split directory not found. Tried:\n"
+                f"  {self.root / f'{self.split}_data'}\n"
+                f"  {self.root / self.split}"
+            )
 
-        for scene_dir in sorted(split_dir.iterdir()):
+        for scene_dir in sorted(split_dir.iterdir(), key=lambda p: p.name):
             if not scene_dir.is_dir():
                 continue
-            frames_dir = scene_dir / "frames"
-            density_dir = scene_dir / "GT_density"
 
-            if frames_dir.exists():
-                frame_files = sorted(frames_dir.glob("*.jpg")) + sorted(
-                    frames_dir.glob("*.png")
+            # Collect all .jpg files sorted by filename (001.jpg, 002.jpg …)
+            frame_files = sorted(
+                scene_dir.glob("*.jpg"),
+                key=lambda p: p.stem,
+            )
+            if len(frame_files) < 2:
+                continue
+
+            scene_start = len(self._samples)
+            for i in range(len(frame_files) - 1):
+                ft_path = frame_files[i]
+                ft1_path = frame_files[i + 1]
+                json_path = ft_path.with_suffix(".json")
+                self._samples.append(
+                    {
+                        "scene": scene_dir.name,
+                        "frame_t": str(ft_path),
+                        "frame_t1": str(ft1_path),
+                        "json": str(json_path) if json_path.exists() else None,
+                        "idx": i,
+                    }
                 )
-                for i in range(len(frame_files) - 1):
-                    density_path = self._find_density(
-                        density_dir, frame_files[i].stem
-                    )
-                    self._samples.append(
-                        {
-                            "scene": scene_dir.name,
-                            "frame_t": str(frame_files[i]),
-                            "frame_t1": str(frame_files[i + 1]),
-                            "density": density_path,
-                            "idx": i,
-                        }
-                    )
-            else:
-                # Try video files inside scene dir
-                for ext in ("*.avi", "*.mp4"):
-                    for vpath in sorted(scene_dir.glob(ext)):
-                        self._index_video(scene_dir, vpath, density_dir)
+            self.scene_ranges[scene_dir.name] = (scene_start, len(self._samples))
 
-    def _index_video(
-        self, scene_dir: Path, vpath: Path, density_dir: Path
-    ) -> None:
-        cap = cv2.VideoCapture(str(vpath))
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        for i in range(n_frames - 1):
-            density_path = self._find_density(density_dir, str(i).zfill(4))
-            self._samples.append(
-                {
-                    "scene": scene_dir.name,
-                    "video": str(vpath),
-                    "frame_t_idx": i,
-                    "density": density_path,
-                    "idx": i,
-                }
-            )
+    def _build_density_from_json(
+        self, json_path: Optional[str], h: int, w: int
+    ) -> torch.Tensor:
+        """Build a Gaussian-smoothed density map from a FDST VIA JSON file.
 
-    @staticmethod
-    def _find_density(density_dir: Path, stem: str) -> Optional[str]:
-        if not density_dir.exists():
-            return None
-        for ext in (".npy", ".h5"):
-            p = density_dir / (stem + ext)
-            if p.exists():
-                return str(p)
-        return None
+        FDST uses VGG Image Annotator (VIA) format — each entry is a dict
+        keyed by "<filename><filesize>" containing bounding-box regions:
+            {
+              "001.jpg143318": {
+                "regions": [
+                  {"shape_attributes": {"name": "rect",
+                                        "x": 373, "y": 18,
+                                        "width": 38, "height": 36}, ...},
+                  ...
+                ]
+              }
+            }
+        Head center = (x + width/2, y + height/2).
+        """
+        from scipy.ndimage import gaussian_filter
 
-    def _load_density(self, path: Optional[str]) -> torch.Tensor:
-        if path is None:
-            return torch.zeros(1, 1, 1)
-        if path.endswith(".npy"):
-            arr = np.load(path).astype(np.float32)
-        elif path.endswith(".h5"):
-            with h5py.File(path, "r") as f:
-                arr = f["density"][:].astype(np.float32)
-        else:
-            return torch.zeros(1, 1, 1)
-        return torch.from_numpy(arr).unsqueeze(0)  # (1, H, W)
+        cx_list: List[float] = []
+        cy_list: List[float] = []
 
-    def _load_pair_from_files(
-        self, sample: dict
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        ft = _load_frame_rgb(sample["frame_t"])
-        ft1 = _load_frame_rgb(sample["frame_t1"])
-        return ft, ft1
+        if json_path is not None:
+            try:
+                with open(json_path, "r") as f:
+                    data = json.load(f)
 
-    def _load_pair_from_video(
-        self, sample: dict
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        cap = cv2.VideoCapture(sample["video"])
-        cap.set(cv2.CAP_PROP_POS_FRAMES, sample["frame_t_idx"])
-        ret0, f0 = cap.read()
-        ret1, f1 = cap.read()
-        cap.release()
-        if not (ret0 and ret1):
-            raise RuntimeError(
-                f"Failed to read frames {sample['frame_t_idx']} from "
-                f"{sample['video']}"
-            )
-        return cv2.cvtColor(f0, cv2.COLOR_BGR2RGB), cv2.cvtColor(
-            f1, cv2.COLOR_BGR2RGB
+                # VIA format: outer dict has one key per image entry
+                if isinstance(data, dict):
+                    for entry in data.values():
+                        if not isinstance(entry, dict):
+                            continue
+                        for region in entry.get("regions", []):
+                            sa = region.get("shape_attributes", {})
+                            if sa.get("name") == "rect":
+                                cx = sa["x"] + sa["width"] / 2.0
+                                cy = sa["y"] + sa["height"] / 2.0
+                                cx_list.append(cx)
+                                cy_list.append(cy)
+                            elif sa.get("name") == "point":
+                                cx_list.append(sa["cx"])
+                                cy_list.append(sa["cy"])
+
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+
+        density = np.zeros((h, w), dtype=np.float32)
+        for cx, cy in zip(cx_list, cy_list):
+            x = int(round(cx))
+            y = int(round(cy))
+            x = np.clip(x, 0, w - 1)
+            y = np.clip(y, 0, h - 1)
+            density[y, x] += 1.0
+
+        density = gaussian_filter(density, sigma=self.density_sigma)
+
+        # Downsample to 1/8 resolution to match CSRNet output
+        dh, dw = max(1, h // 8), max(1, w // 8)
+        density_t = torch.from_numpy(density).unsqueeze(0).unsqueeze(0)
+        density_t = F.interpolate(
+            density_t, size=(dh, dw), mode="bilinear", align_corners=False
         )
+        return density_t.squeeze(0)  # (1, dh, dw)
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -189,14 +244,13 @@ class FDSTDataset(Dataset):
     def __getitem__(self, index: int) -> Dict:
         sample = self._samples[index]
 
-        if "frame_t" in sample:
-            ft_np, ft1_np = self._load_pair_from_files(sample)
-        else:
-            ft_np, ft1_np = self._load_pair_from_video(sample)
+        ft_np = _load_frame_rgb(sample["frame_t"])
+        ft1_np = _load_frame_rgb(sample["frame_t1"])
+        h, w = ft_np.shape[:2]
 
         frame_t = _frame_to_tensor(ft_np, self.transform)
         frame_t1 = _frame_to_tensor(ft1_np, self.transform)
-        density_map = self._load_density(sample["density"])
+        density_map = self._build_density_from_json(sample["json"], h, w)
 
         return {
             "frame_t": frame_t,

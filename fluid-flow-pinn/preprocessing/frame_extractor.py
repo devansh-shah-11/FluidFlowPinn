@@ -62,21 +62,28 @@ def get_video_metadata(video_path: str | Path) -> dict:
         cap.release()
 
 
-def list_fdst_videos(fdst_root: str | Path) -> List[Path]:
-    """Return sorted list of all video files under the FDST data root.
+def list_fdst_scenes(fdst_root: str | Path, split: str = "train") -> List[Path]:
+    """Return sorted list of scene directories for a given FDST split.
 
-    FDST is organized as:
-        fdst/
-          train/
-            <scene_id>/
-              video.avi  (or .mp4)
-          test/
-            <scene_id>/
-              video.avi
-    Falls back to a flat glob if that structure is not found.
+    Actual FDST layout on disk:
+        <fdst_root>/
+          train_data/
+            1/   2/   3/ ...   ← scene dirs with flat .jpg + .json files
+          test_data/
+            1/   2/   3/ ...
+
+    Args:
+        fdst_root: Root directory of the FDST dataset.
+        split: "train" or "test".
+
+    Returns:
+        Sorted list of scene directory Paths.
     """
     root = Path(fdst_root)
-    videos: List[Path] = []
-    for ext in ("*.avi", "*.mp4", "*.AVI", "*.MP4"):
-        videos.extend(root.rglob(ext))
-    return sorted(videos)
+    split_dir = root / f"{split}_data"
+    if not split_dir.exists():
+        # Fallback: try without the _data suffix
+        split_dir = root / split
+    if not split_dir.exists():
+        raise FileNotFoundError(f"FDST split directory not found: {split_dir}")
+    return sorted([d for d in split_dir.iterdir() if d.is_dir()])
