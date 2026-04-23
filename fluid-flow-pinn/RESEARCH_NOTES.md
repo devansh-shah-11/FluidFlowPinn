@@ -14,6 +14,7 @@
    - [Step 2: Preprocessing & Data Pipeline](#step-2-preprocessing--data-pipeline)
    - [Step 3: Branch 1 — CSRNet Density](#step-3-branch-1--csrnet-density)
    - [Step 4: Branch 2 — RAFT Optical Flow](#step-4-branch-2--raft-optical-flow)
+   - [Step 5: Smoke Test — End-to-End Branch 1 + 2](#step-5-smoke-test--end-to-end-branch-1--2)
 5. [Datasets](#5-datasets)
 6. [Design Decisions Log](#6-design-decisions-log)
 7. [Open Questions](#7-open-questions)
@@ -220,6 +221,33 @@ Output: u                  — (B, 2, H/8, W/8)  (ux, uy) in pixels/frame at coa
 ```
 
 For FDST frames (1080×1920): output is `(B, 2, 135, 240)` — matches the CSRNet density map grid for the physics loss.
+
+---
+
+### Step 5: Smoke Test — End-to-End Branch 1 + 2
+
+**File:** `smoke_test.py`
+
+#### What it checks
+
+| Check | What failure would mean |
+|---|---|
+| FDSTDataset shapes + density sum | Dataset loader or annotation parsing broken |
+| CSRNet output `(1, 1, H/8, W/8)` | Frontend stride or backend depth wrong |
+| RAFTFlow output `(1, 2, H/8, W/8)` | Padding logic, RAFT import, or downsample broken |
+| `rho.isfinite()` | NaN/Inf from uninitialised weights or bad forward pass |
+| `u.isfinite()` | RAFT diverged on extreme inputs |
+| `rho.shape[-2:] == u.shape[-2:]` | Grids misaligned — physics loss would be meaningless |
+
+#### Usage
+
+```bash
+python smoke_test.py                              # CPU, synthetic 272x480 frames
+python smoke_test.py --device cuda               # GPU, synthetic frames
+python smoke_test.py --fdst data/fdst --device cuda  # real FDST frames
+```
+
+Falls back to synthetic random tensors automatically if FDST path is not provided or unavailable, so it can run in any environment.
 
 ---
 
