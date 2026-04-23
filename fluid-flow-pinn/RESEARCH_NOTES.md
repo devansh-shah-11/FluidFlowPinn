@@ -125,6 +125,15 @@ RAFT optical flow quality degrades sharply at very low resolution. At 320×240, 
 **FDST JSON format — VIA bounding boxes:**
 The FDST dataset was annotated with the VGG Image Annotator (VIA) tool. Each `.json` stores bounding boxes around each head as `{"x", "y", "width", "height"}`. We extract the box center `(x + w/2, y + h/2)` as the head point to build the density map, matching the standard crowd counting convention.
 
+#### Bug fix — density map integral not preserved after downsampling (2026-04-23)
+
+`F.interpolate(..., mode="bilinear")` computes a weighted **average** of the source pixels, which reduces the sum by the area ratio (64× for 8× downsampling). A density map encodes a count integral — the sum must equal the head count, not the per-pixel average. Fix applied to both `FDSTDataset` and `ShanghaiTechDataset`:
+
+```python
+density_t = F.interpolate(density_t, size=(dh, dw), mode="bilinear", align_corners=False)
+density_t = density_t * (h * w) / (dh * dw)   # restore integral
+```
+
 #### Verified on Colab (2026-04-23)
 - Train pairs: ~8,987 | Test pairs: ~5,987 across 13 scenes
 - Batch shape: `frame_t (4, 3, 1080, 1920)`, `density (4, 1, 135, 240)` ✅

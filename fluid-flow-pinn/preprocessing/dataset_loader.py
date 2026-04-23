@@ -230,12 +230,16 @@ class FDSTDataset(Dataset):
 
         density = gaussian_filter(density, sigma=self.density_sigma)
 
-        # Downsample to 1/8 resolution to match CSRNet output
+        # Downsample to 1/8 resolution to match CSRNet output.
+        # Bilinear interpolation averages pixel values, which reduces the sum
+        # by the area ratio (64×). Multiply by (h*w)/(dh*dw) to restore the
+        # integral so that density_map.sum() ≈ head count.
         dh, dw = max(1, h // 8), max(1, w // 8)
         density_t = torch.from_numpy(density).unsqueeze(0).unsqueeze(0)
         density_t = F.interpolate(
             density_t, size=(dh, dw), mode="bilinear", align_corners=False
         )
+        density_t = density_t * (h * w) / (dh * dw)
         return density_t.squeeze(0)  # (1, dh, dw)
 
     def __len__(self) -> int:
@@ -442,10 +446,12 @@ class ShanghaiTechDataset(Dataset):
         from scipy.ndimage import gaussian_filter
         density = gaussian_filter(density, sigma=15)
 
-        # Downsample to 1/8 resolution to match CSRNet output
+        # Downsample to 1/8 resolution to match CSRNet output.
+        # Restore the integral after bilinear averaging (see FDSTDataset._build_density_from_json).
         dh, dw = max(1, h // 8), max(1, w // 8)
         density_t = torch.from_numpy(density).unsqueeze(0).unsqueeze(0)
         density_t = F.interpolate(density_t, size=(dh, dw), mode="bilinear", align_corners=False)
+        density_t = density_t * (h * w) / (dh * dw)
         return density_t.squeeze(0)  # (1, dh, dw)
 
     def __len__(self) -> int:
