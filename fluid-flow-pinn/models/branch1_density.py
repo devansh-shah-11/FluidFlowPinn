@@ -10,9 +10,12 @@ from torchvision import models
 
 
 # ── VGG-16 frontend (shared backbone) ────────────────────────────────────────
-# CSRNet uses the first 10 layers of VGG-16 as the frontend feature extractor.
-# Output stride after these 10 layers = 8  (three 2×2 max-pools consumed).
-_VGG16_FRONTEND_LAYERS = 10
+# VGG-16 feature layer indices:
+#   0-4  : conv1_1, relu, conv1_2, relu, pool1  → 64ch,  H/2
+#   5-9  : conv2_1, relu, conv2_2, relu, pool2  → 128ch, H/4
+#  10-16 : conv3_1, relu, conv3_2, relu, conv3_3, relu, pool3 → 256ch, H/8
+# We need layers[:17] to reach pool3: 256 channels at 1/8 resolution.
+_VGG16_FRONTEND_LAYERS = 17
 
 
 # ── Dilated convolution backend ───────────────────────────────────────────────

@@ -151,8 +151,8 @@ Three reasons:
 2. **Transfer learning.** ImageNet-pretrained VGG-16 weights give the model strong low/mid-level visual features (edges, textures, object parts) from day one. Training from scratch on FDST's ~9,000 frames would severely underfit.
 3. **Right output stride.** The first 10 VGG-16 layers (up to pool3) produce a feature map at 1/8 the input resolution — exactly what we need to match with RAFT's downsampled flow output. This resolution is a constraint from the physics loss: both `ρ` and `u` must be on the same spatial grid.
 
-**Why only the first 10 VGG-16 layers?**
-Layers 1–10 include conv1_1 through pool3 (three max-pool operations → stride 8). We stop here because:
+**Why the first 17 VGG-16 layers?**
+Layers 0–16 include conv1_1 through pool3 (three max-pool operations → stride 8). We stop here because:
 - Further VGG pooling (pool4, pool5) would reduce spatial resolution to 1/32, making the density map too coarse to localise crowd pressure spatially.
 - The dilated convolution backend replaces those deeper VGG layers with rate-2 dilations, which grow the receptive field without losing resolution.
 
