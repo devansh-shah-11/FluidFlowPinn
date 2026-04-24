@@ -15,9 +15,11 @@
    - [Step 3: Branch 1 — CSRNet Density](#step-3-branch-1--csrnet-density)
    - [Step 4: Branch 2 — RAFT Optical Flow](#step-4-branch-2--raft-optical-flow)
    - [Step 5: Smoke Test — End-to-End Branch 1 + 2](#step-5-smoke-test--end-to-end-branch-1--2)
-5. [Datasets](#5-datasets)
-6. [Design Decisions Log](#6-design-decisions-log)
-7. [Open Questions](#7-open-questions)
+5. [Phase 2 — Physics](#5-phase-2--physics)
+   - [Step 6: Continuity Loss](#step-6-continuity-loss)
+6. [Datasets](#6-datasets)
+7. [Design Decisions Log](#7-design-decisions-log)
+8. [Open Questions](#8-open-questions)
 
 ---
 
@@ -251,7 +253,70 @@ Falls back to synthetic random tensors automatically if FDST path is not provide
 
 ---
 
-## 5. Datasets
+## 5. Phase 2 — Physics
+
+### Step 6: Continuity Loss
+
+**File:** `losses/continuity_loss.py`
+
+#### What we built
+
+`continuity_loss(rho_t, rho_t1, u, fps)` — computes the squared continuity residual:
+
+```
+R = ∂ρ/∂t + ∂(ρ·ux)/∂x + ∂(ρ·uy)/∂y
+L_physics = mean(R²)
+```
+
+`ContinuityLoss` — `nn.Module` wrapper for use in the training loop.
+
+#### Boundary handling: options considered
+
+Computing spatial derivatives `∂(ρu)/∂x` and `∂(ρu)/∂y` requires a choice at image boundaries where one-sided neighbors don't exist. Three options were evaluated:
+
+**Option A — Interior only (no padding, discard boundary pixels)**
+- Compute central differences without padding; output is `(H-2) × (W-2)`.
+- Pro: Every computed value is mathematically exact (O(h²) error).
+- Con: Systematically discards the 1-pixel border from the physics loss. Crowd crushes often happen at barriers and walls, which appear at frame edges — this would create a blind spot exactly where pressure is most dangerous.
+
+**Option B — Replicate padding**
+- Pad the border by replicating the edge pixel, then apply central differences everywhere; output is full `H × W`.
+- Pro: Full spatial coverage.
+- Con: At the boundary, the padded neighbor equals the edge value, so the central difference gives `(x[1] - x[0]) / 2` instead of the correct derivative. For a linear function this underestimates the derivative by 50%. The physics loss is **silently wrong at boundaries** — the worst kind of error.
+
+**Option C — Mixed one-sided / central differences ✅ (chosen)**
+- Forward difference at left/top edge, backward difference at right/bottom edge, central difference in the interior. Output is full `H × W`.
+- Pro: Exact everywhere. Interior pixels have O(h²) error (central); boundary pixels have O(h) error (one-sided), which is acceptable at our spatial scales.
+- Con: Slightly more code than Options A or B.
+
+#### Why Option C
+
+Option B is ruled out — a systematic 50% gradient underestimate at boundaries is worse than no boundary coverage at all. Between A and C, Option C is clearly better for this problem: crowd pressure builds up against physical barriers (walls, fences, stage barriers), which appear at the edges of fixed-camera footage. Option A's blind spot is exactly the wrong place to have one.
+
+#### Implementation
+
+```python
+def _diff_x(x):
+    out = torch.empty_like(x)
+    out[:, :, :,  0]   = x[:, :, :,  1] - x[:, :, :,  0]         # forward
+    out[:, :, :, -1]   = x[:, :, :, -1] - x[:, :, :, -2]         # backward
+    out[:, :, :, 1:-1] = (x[:, :, :, 2:] - x[:, :, :, :-2]) / 2.0
+    return out
+```
+
+The same pattern applies to `_diff_y` along rows.
+
+#### Design decisions
+
+| Decision | Alternative | Reason |
+|---|---|---|
+| Use `rho_t` (not average of `rho_t`, `rho_t1`) for divergence term | Average of both frames | `rho_t` is the density at the spatial snapshot we're differentiating; averaging would mix two time steps into a single spatial derivative, muddling the temporal/spatial separation |
+| Forward difference for `∂ρ/∂t` | Backward, central | The pair `(rho_t, rho_t1)` is a forward step; forward difference is the natural choice and avoids needing `rho_{t-1}` |
+| `mean(R²)` not `sum(R²)` | Sum | Mean is independent of spatial resolution — if we change the density map scale the loss magnitude stays comparable |
+
+---
+
+## 6. Datasets
 
 | Dataset | Role | Split | Status |
 |---|---|---|---|
@@ -275,7 +340,7 @@ FDST Dataset/
 
 ---
 
-## 6. Design Decisions Log
+## 7. Design Decisions Log
 
 | Decision | Alternative considered | Why we chose this |
 |---|---|---|
@@ -290,10 +355,12 @@ FDST Dataset/
 | 1/8 density resolution | 1/4, full resolution | 1/8 is the natural VGG-16 frontend output stride; going finer requires extra upsampling that adds noise |
 | λ2=0.01 for physics loss | 0.1, 0.001 | Too high → physics loss dominates and density accuracy collapses; too low → physics constraint ignored |
 | Batch size 4 | 8, 16 | T4 has 16 GB VRAM; at 1080×1920 inputs with FP16 + grad checkpoint, batch 4 is the safe maximum |
+| Mixed one-sided/central differences for spatial derivatives | Replicate padding (Option B), interior only (Option A) | Option B silently underestimates boundary gradients by 50%; Option A creates a blind spot at frame edges where crowd pressure against barriers is most dangerous; Option C is exact everywhere |
+| `mean(R²)` as physics loss scalar | `sum(R²)` | Mean is resolution-independent — loss magnitude stays comparable if density map scale changes |
 
 ---
 
-## 7. Open Questions
+## 8. Open Questions
 
 - [ ] Will the continuity residual `R` be meaningful at 1/8 resolution, or does downsampling smooth out the local compression signal?
 - [ ] UMN is 30fps at 320×240 — after bicubic upsample to 640×480, will RAFT produce usable flow vectors or will the upsampled frames introduce artifacts?
