@@ -17,6 +17,8 @@
    - [Step 5: Smoke Test — End-to-End Branch 1 + 2](#step-5-smoke-test--end-to-end-branch-1--2)
 5. [Phase 2 — Physics](#5-phase-2--physics)
    - [Step 6: Continuity Loss](#step-6-continuity-loss)
+   - [Step 7: Branch 3 — Pressure Map + Total Loss](#step-7-branch-3--pressure-map--total-loss)
+   - [Step 8: Full PINN Model](#step-8-full-pinn-model)
 6. [Datasets](#6-datasets)
 7. [Design Decisions Log](#7-design-decisions-log)
 8. [Open Questions](#8-open-questions)
@@ -316,6 +318,125 @@ The same pattern applies to `_diff_y` along rows.
 
 ---
 
+### Step 7: Branch 3 — Pressure Map + Total Loss
+
+**Files:** `models/branch3_pressure.py`, `losses/total_loss.py`
+
+#### What we built
+
+`PressureMap` — an `nn.Module` that takes `ρ (B, 1, H, W)` and `u (B, 2, H, W)` and returns a pressure map `P (B, 1, H, W)`:
+
+```
+P(x, y, t) = ρ(x, y, t) · Var_local(u)
+```
+
+where `Var_local(u)` is the average of the per-channel local variances of `ux` and `uy` over a 5×5 sliding window:
+
+```
+Var_local(u) = (Var_window(ux) + Var_window(uy)) / 2
+Var_window(f) = E[f²] - E[f]²    (computed via avg_pool2d)
+```
+
+`TotalLoss` — an `nn.Module` that combines all three loss terms:
+
+```
+L_total = L_count + λ1·L_motion + λ2·‖R‖²
+```
+
+- `L_count` = MSE(predicted density sum per image, GT head count)
+- `L_motion` = EPE (endpoint error) against GT flow when available, else 0
+- `‖R‖²` = continuity residual from `ContinuityLoss`
+- Returns a dict `{total, count, motion, physics}` for logging each term individually
+
+#### Pressure map design
+
+**Why `ρ · Var(u)`?**
+A dense, slowly moving crowd (stadium standing area) has high `ρ` but low `Var(u)` — people all move the same direction. Pressure is low. A crush scenario has high `ρ` and high `Var(u)` — people are being pushed from multiple directions simultaneously. The product captures this interaction. Velocity magnitude alone is insufficient: a fast but uniform flow (e.g., an orderly evacuation) is not dangerous.
+
+**Why local variance over a 5×5 window?**
+Per-pixel variance would be zero for any smooth flow field — variance is a population statistic. A local window (5×5 at H/8 resolution ≈ 40×40 pixels at full resolution) captures the spatial spread of velocity within a human-scale neighbourhood. The window size is a hyperparameter; 5×5 was chosen as the smallest window that reliably captures multi-directional crowd motion in dense sequences.
+
+**Boundary handling — zero-padding (deliberate choice):**
+`avg_pool2d` uses zero-padding by default, which means border pixels see a mix of real values and artificial zeros in their local window. This inflates the apparent variance at image boundaries. We considered replicate padding (which would give zero variance for spatially uniform flow all the way to the border), but rejected it for two reasons:
+1. The border artifact from zero-padding is physically harmless — it will produce slightly elevated pressure near frame edges, which is conservative (safer to over-alert than to miss).
+2. Zero-padding is the simpler, more standard implementation. Replicate padding requires a manual pre-pad step and was introduced only to satisfy a test invariant that isn't physically required.
+
+The test `test_zero_pressure_uniform_flow` checks interior pixels only (cropped by `window_size // 2`), which is where the physical invariant actually holds.
+
+**Why `L_count` uses the density sum (not pixel-wise MSE)?**
+Our ground truth is a *count* per image, not a per-pixel density map for every training frame. ShanghaiTech provides density maps, but FDST annotations are head bounding boxes from which we construct Gaussian maps ourselves. Using the sum preserves the count constraint without assuming our Gaussian-smoothed maps are ground truth at every pixel. Pixel-wise MSE against self-constructed density maps would overfit to our σ=15 px choice.
+
+**Why `L_motion` is 0 when no GT flow is provided?**
+FDST has no optical flow ground truth. Setting `L_motion = 0` in that case is correct: the EPE term should only appear when we have reliable flow labels (CrowdFlow). Passing `gt_flow=None` to `TotalLoss.forward()` signals this cleanly without a separate flag.
+
+#### Output
+
+```
+TotalLoss.forward(rho_t, rho_t1, u, gt_count, gt_flow=None)
+→ {
+    'total':   scalar  — backprop target
+    'count':   scalar  — L_count alone
+    'motion':  scalar  — L_motion alone (0 if no gt_flow)
+    'physics': scalar  — ‖R‖² alone
+  }
+```
+
+---
+
+### Step 8: Full PINN Model
+
+**File:** `models/pinn.py`
+
+#### What we built
+
+`FluidFlowPINN` — a single `nn.Module` that wires all three branches together:
+
+```python
+out = model(frame_t, frame_t1)
+# out = {'rho': (B,1,H/8,W/8), 'rho_t1': (B,1,H/8,W/8), 'u': (B,2,H/8,W/8), 'P': (B,1,H/8,W/8)}
+```
+
+#### Architecture wiring
+
+```
+frame_t  ──► CSRNet ──► rho_t  ──┐
+                                  ├──► PressureMap ──► P
+frame_t1 ──► CSRNet ──► rho_t1   │
+                                  │ (rho_t1 passed to TotalLoss for ∂ρ/∂t)
+frame_t  ──┐
+           ├──► RAFTFlow ──► u ──┘
+frame_t1 ──┘
+```
+
+CSRNet runs twice per forward pass — once for `frame_t`, once for `frame_t1`. This is necessary because both density maps are needed: `rho_t` enters the pressure map and the continuity divergence term, while `rho_t1` enters the temporal derivative `∂ρ/∂t`. Sharing weights between the two calls is correct (it is the same model applied at different time steps) and costs zero extra parameters.
+
+#### Memory design
+
+Two VRAM-saving mechanisms are active by default:
+
+| Mechanism | What it does | Where |
+|---|---|---|
+| Gradient checkpointing | Recomputes VGG frontend activations on backward instead of storing them | `CSRNet(use_grad_checkpoint=True)` |
+| RAFT frozen | RAFT weights have `requires_grad=False`; no gradient storage for flow branch | `RAFTFlow(frozen=True)` |
+
+FP16 is **not** managed inside `FluidFlowPINN`. It is applied externally via `torch.cuda.amp.autocast()` in the training loop. This is the standard PyTorch AMP pattern — the model itself stays in FP32 and AMP selectively casts operations.
+
+**Why not freeze CSRNet too?**
+CSRNet needs to be fine-tuned on FDST to produce accurate density maps for our specific dataset and camera angles. The pretrained VGG-16 weights in the frontend give a warm start, but the dilated backend and density head are randomly initialised and must be trained. RAFT is frozen because it already produces high-quality flow vectors without fine-tuning, and FDST has no flow ground truth to fine-tune against.
+
+#### Output contract
+
+```
+{'rho':    (B, 1, H/8, W/8)   density map at t
+ 'rho_t1': (B, 1, H/8, W/8)  density map at t+1
+ 'u':      (B, 2, H/8, W/8)  flow field (ux, uy)
+ 'P':      (B, 1, H/8, W/8)  pressure map}
+```
+
+`rho_t1` is included in the output so the training loop can pass it directly to `TotalLoss` without re-running CSRNet.
+
+---
+
 ## 6. Datasets
 
 | Dataset | Role | Split | Status |
@@ -357,6 +478,13 @@ FDST Dataset/
 | Batch size 4 | 8, 16 | T4 has 16 GB VRAM; at 1080×1920 inputs with FP16 + grad checkpoint, batch 4 is the safe maximum |
 | Mixed one-sided/central differences for spatial derivatives | Replicate padding (Option B), interior only (Option A) | Option B silently underestimates boundary gradients by 50%; Option A creates a blind spot at frame edges where crowd pressure against barriers is most dangerous; Option C is exact everywhere |
 | `mean(R²)` as physics loss scalar | `sum(R²)` | Mean is resolution-independent — loss magnitude stays comparable if density map scale changes |
+| `P = ρ · Var(u)` for pressure | `P = ρ · ‖u‖`, raw pressure via Navier-Stokes | Velocity magnitude misses directional conflict (orderly fast evacuation ≠ crush); `Var(u)` captures multi-directional compression; full NS pressure requires solving a Poisson equation |
+| 5×5 local window for `Var(u)` | 3×3, 7×7, per-pixel | Per-pixel variance is always zero; 3×3 too small to capture crowd-scale motion spread; 5×5 ≈ 40×40 px at full resolution matches human body width at typical crowd densities |
+| Zero-padding in `avg_pool2d` for pressure | Replicate padding | Zero-padding is standard; the border artifact is conservative (over-estimates pressure at edges, which is safer than under-estimating); replicate padding adds code without a physical justification |
+| `L_count` = MSE(sum(ρ), GT count) | Pixel-wise MSE against density map | GT is a head count, not a validated per-pixel density map; count-loss avoids overfitting to our σ=15 Gaussian construction |
+| `L_motion = 0` when no GT flow | Dummy EPE against zero flow | Penalising u against zero would force RAFT outputs toward zero — a regression toward no motion, which directly breaks the physics loss |
+| CSRNet run twice per forward (frame_t and frame_t1) | Run once, reuse rho_t as rho_t1 | Both time steps are needed for `∂ρ/∂t`; weight sharing is free (same model, different inputs); reusing rho_t would make the temporal derivative always zero |
+| FP16 via external `autocast()`, not inside model | Cast tensors inside `forward()` | Standard PyTorch AMP pattern; keeps model portable and lets the training loop control precision scope |
 
 ---
 
@@ -365,5 +493,7 @@ FDST Dataset/
 - [ ] Will the continuity residual `R` be meaningful at 1/8 resolution, or does downsampling smooth out the local compression signal?
 - [ ] UMN is 30fps at 320×240 — after bicubic upsample to 640×480, will RAFT produce usable flow vectors or will the upsampled frames introduce artifacts?
 - [ ] Should `λ1` and `λ2` be fixed or scheduled (e.g., ramp up physics loss weight as training progresses)?
-- [ ] The pressure proxy `P = ρ · Var(u)` uses a 5×5 local window — is this window size physically motivated or empirical?
+- [x] The pressure proxy `P = ρ · Var(u)` uses a 5×5 local window — is this window size physically motivated or empirical? → Empirical. 5×5 at H/8 resolution ≈ 40×40 px at full resolution, roughly matching human body width at typical crowd densities. Physically motivated would require calibrated pixel-to-metre mapping (Venice dataset). Window size is exposed as a hyperparameter in `PressureMap(window_size=...)` and `configs/default.yaml`.
+- [ ] Does the pressure map `P` need to be normalised before thresholding for the UMN lead-time evaluation, or can a fixed threshold be applied across scenes?
+- [ ] The full PINN model runs CSRNet twice per forward pass (frame_t and frame_t1). At batch size 4 on T4 with FP16, does this double the activation memory footprint of the density branch, or does gradient checkpointing contain it?
 - [ ] ShanghaiTech Part A has images up to 3139 persons — will the Gaussian density maps with σ=15 px overlap too heavily at that density, creating a uniform blob instead of a meaningful map?
