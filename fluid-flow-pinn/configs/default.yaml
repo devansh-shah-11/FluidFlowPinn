@@ -59,8 +59,8 @@ evaluation:
 # ── Data / Preprocessing ──────────────────────────────────────────────────────
 preprocessing:
   fps: 30                       # video frame rate (used for ∂ρ/∂t = Δρ / (1/fps))
-  target_height: 480            # UMN bicubic upsample target
-  target_width: 640             # UMN bicubic upsample target
+  target_height: 1080           # resize all FDST frames to this height; UMN gets bicubic upsample to same
+  target_width: 1920            # resize all FDST frames to this width
 
   # Input normalisation (ImageNet stats — applied before CSRNet and RAFT)
   mean: [0.485, 0.456, 0.406]

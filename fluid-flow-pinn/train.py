@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from losses.total_loss import TotalLoss
 from models.pinn import FluidFlowPINN
 from preprocessing.dataset_loader import FDSTDataset, SequentialSceneSampler
+from torchvision import transforms as T
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,9 +153,24 @@ def _make_loader(
     # Both are sub-splits of the same FDST dataset; validation uses the test split.
     data_root = Path(_cfg(cfg, "data", "fdst", default="data/fdst/"))
     batch_size = _cfg(cfg, "training", "batch_size", default=4)
-    num_workers = _cfg(cfg, "training", "num_workers", default=4)
+    num_workers = min(
+        _cfg(cfg, "training", "num_workers", default=4),
+        os.cpu_count() or 1,
+    )
 
-    dataset = FDSTDataset(root=data_root, split=split)
+    # Resize every frame to a fixed spatial size so the default collator can
+    # stack variable-resolution FDST scenes into a batch.
+    target_h = _cfg(cfg, "preprocessing", "target_height", default=1080)
+    target_w = _cfg(cfg, "preprocessing", "target_width",  default=1920)
+    _MEAN = [0.485, 0.456, 0.406]
+    _STD  = [0.229, 0.224, 0.225]
+    frame_transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((target_h, target_w), antialias=True),
+        T.Normalize(mean=_MEAN, std=_STD),
+    ])
+
+    dataset = FDSTDataset(root=data_root, split=split, transform=frame_transform)
     if len(dataset) == 0:
         raise RuntimeError(
             f"FDSTDataset for split='{split}' is empty. "
@@ -205,7 +221,7 @@ def _validate(
         if gt_flow is not None:
             gt_flow = gt_flow.to(device, non_blocking=True)
 
-        with autocast(enabled=use_fp16):
+        with autocast(device_type="cuda", enabled=use_fp16):
             out = model(frame_t, frame_t1)
             losses = criterion(
                 rho_t=out["rho"],
@@ -291,7 +307,7 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
     )
 
     # ── AMP scaler ────────────────────────────────────────────────────────────
-    scaler = GradScaler(enabled=use_fp16)
+    scaler = GradScaler(device="cuda", enabled=use_fp16)
 
     # ── Checkpoint manager ────────────────────────────────────────────────────
     ckpt_dir  = Path(_cfg(cfg, "output", "checkpoints", default="checkpoints/"))
@@ -355,7 +371,7 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=use_fp16):
+            with autocast(device_type="cuda", enabled=use_fp16):
                 out = model(frame_t, frame_t1)
                 losses = criterion(
                     rho_t=out["rho"],
