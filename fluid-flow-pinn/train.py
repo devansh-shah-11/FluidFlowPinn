@@ -158,23 +158,46 @@ def _make_loader(
         os.cpu_count() or 1,
     )
 
-    # Resize every frame to a fixed spatial size so the default collator can
-    # stack variable-resolution FDST scenes into a batch.
     target_h = _cfg(cfg, "preprocessing", "target_height", default=1080)
     target_w = _cfg(cfg, "preprocessing", "target_width",  default=1920)
     _MEAN = [0.485, 0.456, 0.406]
     _STD  = [0.229, 0.224, 0.225]
     frame_transform = T.Compose([
         T.ToTensor(),
-        T.Resize((target_h, target_w), antialias=True),
         T.Normalize(mean=_MEAN, std=_STD),
     ])
 
     dataset = FDSTDataset(root=data_root, split=split, transform=frame_transform)
+
+    # Optionally filter to only frames whose native resolution matches
+    # target_h × target_w — avoids batching frames of mixed sizes.
+    filter_res = _cfg(cfg, "preprocessing", "filter_resolution", default=True)
+    if filter_res:
+        import cv2
+        kept = [
+            s for s in dataset._samples
+            if (lambda img: img is not None and img.shape[:2] == (target_h, target_w))(
+                cv2.imread(s["frame_t"])
+            )
+        ]
+        n_before = len(dataset._samples)
+        dataset._samples = kept
+        # Rebuild scene_ranges from the filtered sample list
+        dataset.scene_ranges = {}
+        for i, s in enumerate(dataset._samples):
+            scene = s["scene"]
+            if scene not in dataset.scene_ranges:
+                dataset.scene_ranges[scene] = (i, i)
+            dataset.scene_ranges[scene] = (dataset.scene_ranges[scene][0], i + 1)
+        log.info(
+            "%s: kept %d / %d samples matching %dx%d",
+            split, len(dataset._samples), n_before, target_h, target_w,
+        )
+
     if len(dataset) == 0:
         raise RuntimeError(
-            f"FDSTDataset for split='{split}' is empty. "
-            f"Check that data exists at: {data_root / f'{split}_data'}"
+            f"FDSTDataset for split='{split}' is empty after resolution filter "
+            f"({target_h}x{target_w}). Check data at: {data_root / f'{split}_data'}"
         )
 
     if split == "train":
