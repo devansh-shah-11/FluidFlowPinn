@@ -518,6 +518,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fdst-path",                default=None, help="Override data.fdst path (e.g. /data/fdst/)")
     p.add_argument("--wandb-project",            default=None, help="W&B project name")
     p.add_argument("--wandb-entity",             default=None, help="W&B entity / team")
+    p.add_argument("--checkpoint-dir",           default=None, help="Override output.checkpoints directory")
     p.add_argument("--resume",                   default=None, help="Path to checkpoint to resume from")
     p.add_argument("--no-fp16", action="store_true",           help="Disable FP16 mixed precision")
     return p.parse_args()
@@ -542,6 +543,8 @@ def main() -> None:
         cfg.setdefault("training", {})["lr"] = args.lr
     if args.fdst_path is not None:
         cfg.setdefault("data", {})["fdst"] = args.fdst_path
+    if args.checkpoint_dir is not None:
+        cfg.setdefault("output", {})["checkpoints"] = args.checkpoint_dir
     if args.no_fp16:
         cfg.setdefault("model", {})["use_fp16"] = False
 

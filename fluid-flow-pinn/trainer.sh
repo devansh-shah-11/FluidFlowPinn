@@ -24,6 +24,7 @@ singularity exec --bind /scratch --nv \
   python train.py \
     --config configs/default.yaml \
     --fdst-path /scratch/dns5508/FDST_Data/ \
+    --checkpoint-dir /scratch/dns5508/FluidFlowPinn/checkpoints/ \
     --epochs 20 \
     --wandb-project fluid-pinn
 "
