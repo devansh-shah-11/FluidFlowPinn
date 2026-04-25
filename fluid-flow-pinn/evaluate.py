@@ -5,6 +5,20 @@ Usage:
     python evaluate.py --checkpoint checkpoints/best.pt --fdst-path /scratch/dns5508/FDST_Data/
 
     # + save visualizations for the first N batches
+    python evaluate.py \
+    --checkpoint /scratch/dns5508/FluidFlowPinn/checkpoints/best.pt \
+    --fdst-path /scratch/dns5508/FDST_Data/ \
+    --vis-dir /scratch/dns5508/FluidFlowPinn/outputs/vis/ \
+    --vis-batches 5
+
+    python evaluate.py \
+    --checkpoint /scratch/dns5508/FluidFlowPinn/checkpoints/best.pt \
+    --fdst-path /scratch/dns5508/FDST_Data/ \
+    --timeline \
+    --timeline-scene 10 \
+    --vis-dir /scratch/dns5508/FluidFlowPinn/outputs/vis/
+
+
     python evaluate.py --checkpoint checkpoints/best.pt --fdst-path /scratch/.../FDST_Data/ --vis-dir outputs/vis/ --vis-batches 5
 
     # Pressure timeline on a single scene folder (anomaly detection demo)
