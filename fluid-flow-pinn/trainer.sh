@@ -17,9 +17,8 @@ singularity exec --bind /scratch --nv \
   /scratch/dns5508/ubuntu-20.04.3.sif \
   /bin/bash -c "
   source /ext3/miniconda3/etc/profile.d/conda.sh
-  conda activate cv
   export PATH=/home/dns5508/.local/bin:\$PATH
-
+  conda activate cv
   cd /scratch/dns5508/FluidFlowPinn/fluid-flow-pinn
 
   python train.py \
