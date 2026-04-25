@@ -4,6 +4,7 @@
 #SBATCH --error=./logs/%j_%x.err
 #SBATCH --mail-type=END
 #SBATCH --mail-user=dns5508@nyu.edu
+#SBATCH --account=csci_3033_109-2026sp
 #SBATCH --partition=c12m85-a100-1
 #SBATCH --gres=gpu:1
 #SBATCH --time=1:00:00
