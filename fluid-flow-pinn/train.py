@@ -174,13 +174,13 @@ def _make_loader(
     filter_res = _cfg(cfg, "preprocessing", "filter_resolution", default=True)
     if filter_res:
         import cv2
-        kept = [
-            s for s in dataset._samples
-            if (lambda img: img is not None and img.shape[:2] == (target_h, target_w))(
-                cv2.imread(s["frame_t"])
-            )
-        ]
+
+        def _res_ok(path: str) -> bool:
+            img = cv2.imread(path)
+            return img is not None and img.shape[:2] == (target_h, target_w)
+
         n_before = len(dataset._samples)
+        kept = [s for s in dataset._samples if _res_ok(s["frame_t"]) and _res_ok(s["frame_t1"])]
         dataset._samples = kept
         # Rebuild scene_ranges from the filtered sample list
         dataset.scene_ranges = {}
