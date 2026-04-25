@@ -25,6 +25,5 @@ singularity exec --bind /scratch --nv \
     --config configs/default.yaml \
     --fdst-path /scratch/dns5508/FDST_Data/ \
     --epochs 20 \
-    --wandb-project fluid-pinn \
-    --wandb-entity dns5508
+    --wandb-project fluid-pinn
 "
