@@ -93,7 +93,7 @@ CSRNet        RAFT
 L_total = L_count + λ1·L_motion + λ2·‖R‖²
 ```
 - `L_count` = MSE(predicted density sum, GT head count) — from FDST annotations
-- `L_motion` = EPE (endpoint error on CrowdFlow) — only when GT flow available
+- `L_motion` = EPE against GT flow (CrowdFlow) when available; else density warp consistency `L1(warp(rho_t, u), rho_t1)` — always active
 - `λ1 = 0.1`, `λ2 = 0.01` (starting values, tunable)
 
 ---
@@ -344,7 +344,7 @@ L_total = L_count + λ1·L_motion + λ2·‖R‖²
 ```
 
 - `L_count` = MSE(predicted density sum per image, GT head count)
-- `L_motion` = EPE (endpoint error) against GT flow when available, else 0
+- `L_motion` = EPE (endpoint error) against GT flow when available (CrowdFlow); otherwise **density warp consistency** — `L1(warp(rho_t, u), rho_t1)` using RAFT's predicted flow as a self-supervised signal (see below)
 - `‖R‖²` = continuity residual from `ContinuityLoss`
 - Returns a dict `{total, count, motion, physics}` for logging each term individually
 
@@ -363,11 +363,27 @@ Per-pixel variance would be zero for any smooth flow field — variance is a pop
 
 The test `test_zero_pressure_uniform_flow` checks interior pixels only (cropped by `window_size // 2`), which is where the physical invariant actually holds.
 
+**Resolution filter checks both frames in a pair (bug fix, 2026-04-25):**
+The training loop filters FDST samples to only those matching the target resolution (e.g. 720×1280). The original filter only checked `frame_t`, not `frame_t1`. A pair where `frame_t` is 720×1280 but `frame_t1` is a different resolution (possible at scene boundaries or in mixed-resolution scenes) would pass the filter and cause a shape mismatch in the batch collator or silently produce an incorrect temporal derivative. Fixed to require both frames match:
+
+```python
+kept = [s for s in dataset._samples if _res_ok(s["frame_t"]) and _res_ok(s["frame_t1"])]
+```
+
 **Why `L_count` uses the density sum (not pixel-wise MSE)?**
 Our ground truth is a *count* per image, not a per-pixel density map for every training frame. ShanghaiTech provides density maps, but FDST annotations are head bounding boxes from which we construct Gaussian maps ourselves. Using the sum preserves the count constraint without assuming our Gaussian-smoothed maps are ground truth at every pixel. Pixel-wise MSE against self-constructed density maps would overfit to our σ=15 px choice.
 
-**Why `L_motion` is 0 when no GT flow is provided?**
-FDST has no optical flow ground truth. Setting `L_motion = 0` in that case is correct: the EPE term should only appear when we have reliable flow labels (CrowdFlow). Passing `gt_flow=None` to `TotalLoss.forward()` signals this cleanly without a separate flag.
+**Why density warp consistency instead of `L_motion = 0` on FDST?**
+FDST has no optical flow ground truth, so EPE against GT flow is unavailable. The original implementation set `L_motion = 0` in this case, making `λ1` completely inactive and wasting a training signal. The fix: use RAFT's *predicted* flow `u` as a self-supervised signal by warping `rho_t` forward and comparing to `rho_t1`:
+
+```python
+rho_warped = grid_sample(rho_t, grid_from_u)    # bilinear warp via u
+l_motion   = L1(rho_warped, rho_t1)
+```
+
+This enforces that the density evolution is consistent with the optical flow — if RAFT says people moved right, the density at t+1 should match what you get by shifting density at t rightward. This directly tightens the coupling between `rho` and `u`, which is what makes the pressure map `P = ρ · Var(u)` reliable. When GT flow *is* available, EPE is used instead (the supervised signal is stronger).
+
+The warp is implemented via `torch.nn.functional.grid_sample` with `padding_mode="border"` to handle pixels that flow outside the frame boundary.
 
 #### Output
 
@@ -482,7 +498,8 @@ FDST Dataset/
 | 5×5 local window for `Var(u)` | 3×3, 7×7, per-pixel | Per-pixel variance is always zero; 3×3 too small to capture crowd-scale motion spread; 5×5 ≈ 40×40 px at full resolution matches human body width at typical crowd densities |
 | Zero-padding in `avg_pool2d` for pressure | Replicate padding | Zero-padding is standard; the border artifact is conservative (over-estimates pressure at edges, which is safer than under-estimating); replicate padding adds code without a physical justification |
 | `L_count` = MSE(sum(ρ), GT count) | Pixel-wise MSE against density map | GT is a head count, not a validated per-pixel density map; count-loss avoids overfitting to our σ=15 Gaussian construction |
-| `L_motion = 0` when no GT flow | Dummy EPE against zero flow | Penalising u against zero would force RAFT outputs toward zero — a regression toward no motion, which directly breaks the physics loss |
+| Density warp consistency when no GT flow | `L_motion = 0` (original), dummy EPE against zero flow | Original implementation made λ1 permanently inactive on FDST. Warp consistency uses RAFT's predicted flow as self-supervision: `L1(warp(rho_t, u), rho_t1)` — trains CSRNet to produce density maps that evolve consistently with the flow, tightening the ρ–u coupling that the pressure map depends on. Setting to 0 wastes a training signal; EPE against zero would force RAFT toward no-motion. |
+| Resolution filter checks both `frame_t` and `frame_t1` | Check only `frame_t` (original) | Original bug: pairs where `frame_t1` has a different resolution would pass the filter, causing shape mismatches or a broken temporal derivative `∂ρ/∂t`. Fixed to require both frames match the target resolution. |
 | CSRNet run twice per forward (frame_t and frame_t1) | Run once, reuse rho_t as rho_t1 | Both time steps are needed for `∂ρ/∂t`; weight sharing is free (same model, different inputs); reusing rho_t would make the temporal derivative always zero |
 | FP16 via external `autocast()`, not inside model | Cast tensors inside `forward()` | Standard PyTorch AMP pattern; keeps model portable and lets the training loop control precision scope |
 
