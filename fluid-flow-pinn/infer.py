@@ -233,6 +233,72 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     return np.clip(var, 0.0, None)
 
 
+def _denoise_flow(
+    u_np: np.ndarray,
+    rho_np: np.ndarray,
+    rho_mask_thresh: float,
+    mag_floor_px: float,
+) -> np.ndarray:
+    """Suppress RAFT noise floor before computing Var(u).
+
+    Two gates, both motivated by the static-dense-crowd failure mode where
+    RAFT produces non-zero flow on textured-but-stationary regions:
+      • rho-gate: zero out flow where density (resampled to flow grid) is
+        below `rho_mask_thresh` — no people, no flow.
+      • magnitude floor: zero out per-pixel flow whose magnitude (px/frame
+        on the H/8 grid) is below `mag_floor_px` — treats jitter as zero.
+    """
+    if u_np.size == 0:
+        return u_np
+    out = u_np.astype(np.float32, copy=True)
+    Hf, Wf = out.shape[1], out.shape[2]
+
+    if rho_mask_thresh > 0.0 and rho_np is not None:
+        rho_resized = cv2.resize(
+            rho_np.astype(np.float32), (Wf, Hf), interpolation=cv2.INTER_LINEAR
+        )
+        rho_gate = (rho_resized >= rho_mask_thresh).astype(np.float32)
+        out[0] *= rho_gate
+        out[1] *= rho_gate
+
+    if mag_floor_px > 0.0:
+        mag = np.sqrt(out[0] ** 2 + out[1] ** 2)
+        keep = (mag >= mag_floor_px).astype(np.float32)
+        out[0] *= keep
+        out[1] *= keep
+
+    return out
+
+
+def _compute_pressure_np(
+    rho_np: np.ndarray,
+    u_np: np.ndarray,
+    window: int,
+    rho_alpha: float,
+    per_capita: bool,
+    per_capita_eps: float,
+) -> np.ndarray:
+    """Recompute P from ρ and (denoised) u with configurable coupling.
+
+    Coupling modes:
+      • per_capita=True : P = Var(u) / (rho + eps)  — flags per-capita turbulence
+      • else            : P = (rho ** rho_alpha) * Var(u)
+        - rho_alpha=1 reproduces the original P = rho * Var(u)
+        - rho_alpha=0 gives P = Var(u) (decoupled from density)
+    """
+    var_u = _local_var_np(u_np, k=window)  # (Hf, Wf)
+    h, w = rho_np.shape[-2:]
+    if var_u.shape != (h, w):
+        var_u = cv2.resize(var_u, (w, h), interpolation=cv2.INTER_LINEAR)
+    if per_capita:
+        return var_u / (rho_np.astype(np.float32) + per_capita_eps)
+    if rho_alpha == 1.0:
+        return rho_np.astype(np.float32) * var_u
+    if rho_alpha == 0.0:
+        return var_u
+    return (rho_np.astype(np.float32) ** rho_alpha) * var_u
+
+
 def _flow_arrows(
     frame_bgr: np.ndarray,
     u_np: np.ndarray,
@@ -305,6 +371,7 @@ def _build_dashboard(
     frame_idx: int,
     p_max: Optional[float],
     pressure_window: int = 5,
+    p_formula: str = "rho * Var(u)",
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
@@ -359,7 +426,7 @@ def _build_dashboard(
     if P_np is not None:
         P_pane = _heatmap_overlay(fr, P_np, cmap=cv2.COLORMAP_TURBO,
                                   alpha=0.55, vmin=0.0)
-        _label(P_pane, f"P = rho * Var(u)  max={P_np.max():.3f}")
+        _label(P_pane, f"P = {p_formula}  max={P_np.max():.3f}")
     else:
         P_pane = fr.copy()
         _label(P_pane, "P  (need 2 frames)")
@@ -412,6 +479,15 @@ def run(args: argparse.Namespace) -> None:
     out_dir: Optional[Path] = Path(args.out_dir) if args.out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.per_capita:
+        p_formula = "Var(u) / (rho+eps)"
+    elif args.rho_alpha == 1.0:
+        p_formula = "rho * Var(u)"
+    elif args.rho_alpha == 0.0:
+        p_formula = "Var(u)"
+    else:
+        p_formula = f"rho^{args.rho_alpha:g} * Var(u)"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
     history: deque[float] = deque(maxlen=history_len)
@@ -469,7 +545,31 @@ def run(args: argparse.Namespace) -> None:
                     out = model(prev_tensor, cur_tensor)
                 rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
                 u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
-                P_np   = out["P"].squeeze().detach().float().cpu().numpy()
+
+                # Fix #2: suppress RAFT noise floor on static / empty regions
+                # before variance is computed.
+                u_np = _denoise_flow(
+                    u_np, rho_np,
+                    rho_mask_thresh=args.rho_mask_thresh,
+                    mag_floor_px=args.flow_mag_floor,
+                )
+
+                # Fix #1: decouple ρ from Var(u) in the danger score. When the
+                # user passes a non-default coupling, recompute P here instead
+                # of using model output (which is fixed at P = ρ · Var(u)).
+                use_custom_P = args.per_capita or args.rho_alpha != 1.0 \
+                    or args.rho_mask_thresh > 0.0 or args.flow_mag_floor > 0.0
+                if use_custom_P:
+                    P_np = _compute_pressure_np(
+                        rho_np, u_np,
+                        window=cfg.get("model", {}).get("pressure_window", 5),
+                        rho_alpha=args.rho_alpha,
+                        per_capita=args.per_capita,
+                        per_capita_eps=args.per_capita_eps,
+                    )
+                else:
+                    P_np = out["P"].squeeze().detach().float().cpu().numpy()
+
                 p_max  = float(P_np.max())
                 history.append(p_max)
                 all_scores.append(p_max)
@@ -485,7 +585,7 @@ def run(args: argparse.Namespace) -> None:
             display_frame = prev_resized if prev_resized is not None else frame_resized
             dash = _build_dashboard(
                 display_frame, rho_np, u_np, P_np, history, threshold,
-                fps_actual, frame_idx, p_max,
+                fps_actual, frame_idx, p_max, p_formula=p_formula,
             )
 
             if out_dir and writer is None:
@@ -561,6 +661,22 @@ def _parse_args() -> argparse.Namespace:
                    help="Inference width — frames are resized to this (must be /8)")
     p.add_argument("--height",     type=int, default=720,
                    help="Inference height — frames are resized to this (must be /8)")
+    # Fix #1 — decouple ρ and Var(u) in the danger score
+    p.add_argument("--rho-alpha",   type=float, default=1.0,
+                   help="Exponent on rho in P = rho^alpha * Var(u). "
+                        "1.0 = original; 0.0 = Var(u) only; 0.25 = mild coupling.")
+    p.add_argument("--per-capita",  action="store_true",
+                   help="Use P = Var(u) / (rho + eps) — per-capita turbulence. "
+                        "Overrides --rho-alpha.")
+    p.add_argument("--per-capita-eps", type=float, default=1e-3,
+                   help="Epsilon in per-capita denominator (default 1e-3).")
+    # Fix #2 — RAFT noise-floor suppression before Var(u)
+    p.add_argument("--rho-mask-thresh", type=float, default=0.0,
+                   help="Zero-out flow where rho < this (people-per-pixel). "
+                        "0 disables. Try 1e-4 .. 1e-3.")
+    p.add_argument("--flow-mag-floor",  type=float, default=0.0,
+                   help="Zero-out flow whose |u| (px/frame on H/8 grid) is below this. "
+                        "0 disables. Try 0.5 .. 1.5.")
     return p.parse_args()
 
 
