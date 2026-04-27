@@ -39,7 +39,10 @@ class CSRNet(nn.Module):
       Backend  : 6× dilated conv (rate=2) → (B,  64, H/8, W/8)
       Output   : 1×1 conv                 → (B,   1, H/8, W/8) density map ρ
 
-    The output is passed through softplus so density is non-negative.
+    Negative values are clamped to zero at output (ReLU). This matches the
+    original CSRNet calibration — pretrained ShanghaiTech checkpoints emit
+    small positive values on heads and ≈0 elsewhere; using softplus instead
+    would lift every "zero" pixel to ln(2)≈0.693 and inflate counts massively.
 
     Input : (B, 3, H, W)  ImageNet-normalised RGB
     Output: (B, 1, H/8, W/8)  density map ρ  (sum ≈ person count)
@@ -100,7 +103,7 @@ class CSRNet(nn.Module):
             x = self.frontend(x)
         x = self.backend(x)
         x = self.output_layer(x)
-        return F.softplus(x)
+        return F.relu(x)
 
     def freeze(self) -> None:
         """Freeze all parameters — use after loading pretrained weights."""
@@ -164,7 +167,7 @@ def load_csrnet(
         model = CSRNet(use_grad_checkpoint=use_grad_checkpoint)
 
     if weights_path is not None:
-        state = torch.load(weights_path, map_location="cpu")
+        state = torch.load(weights_path, map_location="cpu", weights_only=False)
         if isinstance(state, dict):
             for wrap_key in ("model", "state_dict", "model_state_dict"):
                 if wrap_key in state and isinstance(state[wrap_key], dict):
