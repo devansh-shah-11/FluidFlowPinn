@@ -235,39 +235,38 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
 
 def _denoise_flow(
     u_np: np.ndarray,
-    rho_np: np.ndarray,
-    rho_mask_thresh: float,
-    mag_floor_px: float,
+    spatial_sigma: float,
 ) -> np.ndarray:
-    """Suppress RAFT noise floor before computing Var(u).
+    """Spatial Gaussian smooth on u to attenuate RAFT pixel-level noise.
 
-    Two gates, both motivated by the static-dense-crowd failure mode where
-    RAFT produces non-zero flow on textured-but-stationary regions:
-      • rho-gate: zero out flow where density (resampled to flow grid) is
-        below `rho_mask_thresh` — no people, no flow.
-      • magnitude floor: zero out per-pixel flow whose magnitude (px/frame
-        on the H/8 grid) is below `mag_floor_px` — treats jitter as zero.
+    A smooth low-pass — unlike hard gates, this introduces no new edges, so
+    Var(u) over the smoothed field reflects real coherent motion, not the
+    boundaries we drew. `spatial_sigma` is in flow-grid pixels (H/8 units);
+    sigma=1.0 is a gentle 1-pixel blur. Pass 0 to disable.
     """
-    if u_np.size == 0:
-        return u_np
+    if spatial_sigma <= 0.0 or u_np.size == 0:
+        return u_np.astype(np.float32, copy=False)
     out = u_np.astype(np.float32, copy=True)
-    Hf, Wf = out.shape[1], out.shape[2]
-
-    if rho_mask_thresh > 0.0 and rho_np is not None:
-        rho_resized = cv2.resize(
-            rho_np.astype(np.float32), (Wf, Hf), interpolation=cv2.INTER_LINEAR
-        )
-        rho_gate = (rho_resized >= rho_mask_thresh).astype(np.float32)
-        out[0] *= rho_gate
-        out[1] *= rho_gate
-
-    if mag_floor_px > 0.0:
-        mag = np.sqrt(out[0] ** 2 + out[1] ** 2)
-        keep = (mag >= mag_floor_px).astype(np.float32)
-        out[0] *= keep
-        out[1] *= keep
-
+    out[0] = cv2.GaussianBlur(out[0], ksize=(0, 0), sigmaX=spatial_sigma)
+    out[1] = cv2.GaussianBlur(out[1], ksize=(0, 0), sigmaX=spatial_sigma)
     return out
+
+
+def _temporal_ema(
+    u_prev_ema: Optional[np.ndarray],
+    u_cur: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Exponential moving average across frames: u_t = α·u + (1-α)·u_{t-1}.
+
+    RAFT noise is roughly uncorrelated frame-to-frame; real motion is
+    correlated. EMA suppresses the former without flattening the latter or
+    creating edges. alpha=1.0 disables (no smoothing). alpha=0.5 averages
+    the current frame with the running history equally.
+    """
+    if u_prev_ema is None or alpha >= 1.0:
+        return u_cur.astype(np.float32, copy=True)
+    return (alpha * u_cur + (1.0 - alpha) * u_prev_ema).astype(np.float32)
 
 
 def _compute_pressure_np(
@@ -523,6 +522,7 @@ def run(args: argparse.Namespace) -> None:
     writer: Optional[cv2.VideoWriter] = None
     prev_tensor: Optional[torch.Tensor] = None
     prev_resized: Optional[np.ndarray] = None
+    u_ema: Optional[np.ndarray] = None
     frame_idx = 0
     last_t = time.time()
     fps_actual = 0.0
@@ -546,19 +546,17 @@ def run(args: argparse.Namespace) -> None:
                 rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
                 u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
 
-                # Fix #2: suppress RAFT noise floor on static / empty regions
-                # before variance is computed.
-                u_np = _denoise_flow(
-                    u_np, rho_np,
-                    rho_mask_thresh=args.rho_mask_thresh,
-                    mag_floor_px=args.flow_mag_floor,
-                )
+                # Smooth u to suppress RAFT noise without introducing edges.
+                # Spatial Gaussian first, then temporal EMA across frames.
+                u_np = _denoise_flow(u_np, spatial_sigma=args.flow_spatial_sigma)
+                u_np = _temporal_ema(u_ema, u_np, alpha=args.flow_ema_alpha)
+                u_ema = u_np  # carry forward for next frame
 
-                # Fix #1: decouple ρ from Var(u) in the danger score. When the
-                # user passes a non-default coupling, recompute P here instead
-                # of using model output (which is fixed at P = ρ · Var(u)).
+                # Decouple ρ from Var(u) in the danger score. When the user
+                # passes a non-default coupling, recompute P here instead of
+                # using model output (which is fixed at P = ρ · Var(u)).
                 use_custom_P = args.per_capita or args.rho_alpha != 1.0 \
-                    or args.rho_mask_thresh > 0.0 or args.flow_mag_floor > 0.0
+                    or args.flow_spatial_sigma > 0.0 or args.flow_ema_alpha < 1.0
                 if use_custom_P:
                     P_np = _compute_pressure_np(
                         rho_np, u_np,
@@ -670,13 +668,13 @@ def _parse_args() -> argparse.Namespace:
                         "Overrides --rho-alpha.")
     p.add_argument("--per-capita-eps", type=float, default=1e-3,
                    help="Epsilon in per-capita denominator (default 1e-3).")
-    # Fix #2 — RAFT noise-floor suppression before Var(u)
-    p.add_argument("--rho-mask-thresh", type=float, default=0.0,
-                   help="Zero-out flow where rho < this (people-per-pixel). "
-                        "0 disables. Try 1e-4 .. 1e-3.")
-    p.add_argument("--flow-mag-floor",  type=float, default=0.0,
-                   help="Zero-out flow whose |u| (px/frame on H/8 grid) is below this. "
-                        "0 disables. Try 0.5 .. 1.5.")
+    # RAFT noise suppression — smooth, edge-free
+    p.add_argument("--flow-spatial-sigma", type=float, default=0.0,
+                   help="Gaussian sigma (in H/8-grid pixels) for spatial smooth on u "
+                        "before Var(u). 0 disables. Try 0.8 .. 1.5.")
+    p.add_argument("--flow-ema-alpha",     type=float, default=1.0,
+                   help="Temporal EMA on u: u_t = alpha*u + (1-alpha)*u_{t-1}. "
+                        "1.0 disables. Try 0.4 .. 0.6.")
     return p.parse_args()
 
 
