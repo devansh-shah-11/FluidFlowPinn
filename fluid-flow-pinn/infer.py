@@ -11,16 +11,21 @@ Modes:
   • Single image: --source path/to/img.jpg   (only ρ is shown; P needs two frames)
 
 Examples:
-    # Headless: process a clip, save annotated mp4 + timeline png
+    # No-training mode: pretrained ShanghaiTech CSRNet + torchvision RAFT
+    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
+        --source clip.mp4 --out-dir outputs/infer_run/
+
+    # Same, with live window
+    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
+        --source clip.mp4 --out-dir outputs/infer_run/ --display
+
+    # Webcam
+    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
+        --source 0 --display
+
+    # Or, after a training run, use a full checkpoint instead
     python infer.py --checkpoint checkpoints/best.pt --source clip.mp4 \\
         --out-dir outputs/infer_run/
-
-    # With live window
-    python infer.py --checkpoint checkpoints/best.pt --source clip.mp4 \\
-        --out-dir outputs/infer_run/ --display
-
-    # Webcam, live only (set out-dir if you also want the recording)
-    python infer.py --checkpoint checkpoints/best.pt --source 0 --display
 """
 
 from __future__ import annotations
@@ -117,28 +122,56 @@ class _Source:
 
 # ── Model wrapper ────────────────────────────────────────────────────────────
 
-def _load_model(checkpoint_path: Path, device: torch.device) -> tuple:
-    """Load the PINN from a training checkpoint. Returns (model, cfg, use_fp16)."""
+def _load_model(
+    checkpoint_path: Optional[Path],
+    csrnet_weights: Optional[Path],
+    device: torch.device,
+) -> tuple:
+    """Load the PINN. Two modes:
+
+      • `checkpoint_path` given: load a full training checkpoint (best.pt).
+      • `csrnet_weights` given: build the PINN with ShanghaiTech CSRNet
+        weights for the density branch and torchvision-pretrained RAFT
+        for the flow branch. Both branches are frozen — no training
+        was needed because PressureMap has no learnable params.
+    """
     repo_root = Path(__file__).parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
     from models.pinn import FluidFlowPINN
 
-    log.info("Loading checkpoint: %s", checkpoint_path)
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    cfg  = ckpt.get("config", {}) or {}
+    if checkpoint_path is not None:
+        log.info("Loading training checkpoint: %s", checkpoint_path)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        cfg  = ckpt.get("config", {}) or {}
+        use_fp16 = cfg.get("model", {}).get("use_fp16", True) and device.type == "cuda"
+        model = FluidFlowPINN(
+            use_grad_checkpoint=False,
+            raft_frozen=True,
+            pressure_window=cfg.get("model", {}).get("pressure_window", 5),
+        ).to(device)
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+        log.info("Model loaded (epoch %s, val_loss=%.4f) | device=%s fp16=%s",
+                 ckpt.get("epoch", "?"), ckpt.get("val_loss", float("nan")),
+                 device, use_fp16)
+        return model, cfg, use_fp16
 
-    use_fp16 = cfg.get("model", {}).get("use_fp16", True) and device.type == "cuda"
+    assert csrnet_weights is not None, "Need either --checkpoint or --csrnet-weights"
+    log.info("Building inference-only PINN | CSRNet=%s  RAFT=torchvision-pretrained",
+             csrnet_weights)
+    cfg = {}
+    use_fp16 = device.type == "cuda"
     model = FluidFlowPINN(
         use_grad_checkpoint=False,
         raft_frozen=True,
-        pressure_window=cfg.get("model", {}).get("pressure_window", 5),
+        pressure_window=5,
+        csrnet_weights=str(csrnet_weights),
+        freeze_density=True,
     ).to(device)
-    model.load_state_dict(ckpt["model"])
     model.eval()
-    log.info("Model loaded (epoch %s, val_loss=%.4f) | device=%s fp16=%s",
-             ckpt.get("epoch", "?"), ckpt.get("val_loss", float("nan")),
+    log.info("Model ready (CSRNet frozen, RAFT frozen) | device=%s fp16=%s",
              device, use_fp16)
     return model, cfg, use_fp16
 
@@ -296,7 +329,12 @@ def _build_dashboard(
 @torch.no_grad()
 def run(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, cfg, use_fp16 = _load_model(Path(args.checkpoint), device)
+    ckpt = Path(args.checkpoint) if args.checkpoint else None
+    csrw = Path(args.csrnet_weights) if args.csrnet_weights else None
+    if (ckpt is None) == (csrw is None):
+        log.error("Specify exactly one of --checkpoint or --csrnet-weights")
+        sys.exit(2)
+    model, cfg, use_fp16 = _load_model(ckpt, csrw, device)
 
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
@@ -436,7 +474,11 @@ def run(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Realtime PINN inference dashboard")
-    p.add_argument("--checkpoint", required=True, help="Path to trained .pt checkpoint")
+    p.add_argument("--checkpoint",      default=None,
+                   help="Path to a full training checkpoint .pt (best.pt)")
+    p.add_argument("--csrnet-weights",  default=None,
+                   help="Path to a ShanghaiTech CSRNet .pth — runs inference with "
+                        "pretrained CSRNet + torchvision-pretrained RAFT, no training")
     p.add_argument("--source",     required=True,
                    help="Video file path, image path, or webcam index (e.g. 0)")
     p.add_argument("--out-dir",    default=None,
