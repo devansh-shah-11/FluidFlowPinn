@@ -218,6 +218,51 @@ def _label(img: np.ndarray, text: str, y: int = 26) -> None:
                 (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
+    """Per-pixel local variance of a 2-channel flow field (matches PressureMap).
+
+    u_np: (2, H, W). Returns (H, W).
+    """
+    ux, uy = u_np[0].astype(np.float32), u_np[1].astype(np.float32)
+    kernel = (k, k)
+    Ex_x  = cv2.blur(ux, kernel)
+    Ex_y  = cv2.blur(uy, kernel)
+    Ex2_x = cv2.blur(ux * ux, kernel)
+    Ex2_y = cv2.blur(uy * uy, kernel)
+    var = ((Ex2_x - Ex_x ** 2) + (Ex2_y - Ex_y ** 2)) / 2.0
+    return np.clip(var, 0.0, None)
+
+
+def _flow_arrows(
+    frame_bgr: np.ndarray,
+    u_np: np.ndarray,
+    step: int = 24,
+    scale: float = 1.0,
+) -> np.ndarray:
+    """Sparse arrow overlay showing flow direction. u_np: (2, H', W')."""
+    out = frame_bgr.copy()
+    h, w = frame_bgr.shape[:2]
+    # Upsample u to frame resolution
+    ux = cv2.resize(u_np[0].astype(np.float32), (w, h),
+                    interpolation=cv2.INTER_LINEAR)
+    uy = cv2.resize(u_np[1].astype(np.float32), (w, h),
+                    interpolation=cv2.INTER_LINEAR)
+    # Account for the H/8 grid: each grid cell is 8 input pixels, so multiply
+    # the (already-rescaled) flow by 8 to get input-pixel displacements.
+    ux *= 8.0 * scale
+    uy *= 8.0 * scale
+    for y in range(step // 2, h, step):
+        for x in range(step // 2, w, step):
+            dx, dy = float(ux[y, x]), float(uy[y, x])
+            mag = (dx * dx + dy * dy) ** 0.5
+            if mag < 1.0:
+                continue
+            cv2.arrowedLine(out, (x, y),
+                            (int(x + dx), int(y + dy)),
+                            (0, 255, 255), 1, tipLength=0.35)
+    return out
+
+
 def _render_timeline_strip(
     history: deque[float],
     threshold: float,
@@ -252,32 +297,39 @@ def _render_timeline_strip(
 def _build_dashboard(
     frame_bgr: np.ndarray,
     rho_np: Optional[np.ndarray],
+    u_np: Optional[np.ndarray],
     P_np: Optional[np.ndarray],
     history: deque[float],
     threshold: float,
     fps_actual: float,
     frame_idx: int,
     p_max: Optional[float],
+    pressure_window: int = 5,
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
-    Layout (rows × cols):
+    Layout (3 rows × 2 cols):
         ┌──────────┬──────────┐
-        │   raw    │ ρ overlay│
+        │   input  │ rho      │
         ├──────────┼──────────┤
-        │ P overlay│  status  │
+        │  |u| +   │ Var(u)   │
+        │  arrows  │          │
+        ├──────────┼──────────┤
+        │   P      │ status   │
         ├──────────┴──────────┤
         │  P(t) live timeline │
         └─────────────────────┘
     """
     h, w = frame_bgr.shape[:2]
 
-    # Pane size — shrink to keep the dashboard manageable on small screens.
     target_w = 640
-    scale = target_w / w
     pane_w = target_w
-    pane_h = int(h * scale)
+    pane_h = int(h * (target_w / w))
     fr = cv2.resize(frame_bgr, (pane_w, pane_h))
+
+    # Row 1 — input + ρ
+    input_pane = fr.copy()
+    _label(input_pane, "input")
 
     if rho_np is not None:
         rho_pane = _heatmap_overlay(fr, rho_np, cmap=cv2.COLORMAP_HOT,
@@ -287,15 +339,31 @@ def _build_dashboard(
         rho_pane = fr.copy()
         _label(rho_pane, "rho  (n/a)")
 
+    # Row 2 — |u| (with arrows) + Var(u)
+    if u_np is not None:
+        u_mag = np.sqrt(u_np[0] ** 2 + u_np[1] ** 2)
+        u_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_COOL,
+                                  alpha=0.45, vmin=0.0)
+        u_pane = _flow_arrows(u_pane, u_np, step=24, scale=1.0)
+        _label(u_pane, f"|u|  max={u_mag.max():.2f} px/frame")
+
+        var_u = _local_var_np(u_np, k=pressure_window)
+        var_pane = _heatmap_overlay(fr, var_u, cmap=cv2.COLORMAP_PLASMA,
+                                    alpha=0.55, vmin=0.0)
+        _label(var_pane, f"Var(u)  max={var_u.max():.2f}")
+    else:
+        u_pane = fr.copy(); _label(u_pane, "|u|  (need 2 frames)")
+        var_pane = fr.copy(); _label(var_pane, "Var(u)  (need 2 frames)")
+
+    # Row 3 — P + status
     if P_np is not None:
         P_pane = _heatmap_overlay(fr, P_np, cmap=cv2.COLORMAP_TURBO,
                                   alpha=0.55, vmin=0.0)
-        _label(P_pane, f"P  max={P_np.max():.3f}")
+        _label(P_pane, f"P = rho * Var(u)  max={P_np.max():.3f}")
     else:
         P_pane = fr.copy()
         _label(P_pane, "P  (need 2 frames)")
 
-    # Status pane — text-only metrics
     status = np.zeros_like(fr)
     alarm = (p_max is not None) and (p_max > threshold)
     color_alarm = (60, 60, 220) if alarm else (60, 200, 60)
@@ -314,10 +382,10 @@ def _build_dashboard(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (230, 230, 230), 1, cv2.LINE_AA)
 
-    _label(fr, "input")
-    top = np.hstack([fr, rho_pane])
-    bot = np.hstack([P_pane, status])
-    grid = np.vstack([top, bot])
+    row1 = np.hstack([input_pane, rho_pane])
+    row2 = np.hstack([u_pane,     var_pane])
+    row3 = np.hstack([P_pane,     status])
+    grid = np.vstack([row1, row2, row3])
 
     timeline = _render_timeline_strip(history, threshold,
                                       width=grid.shape[1], height=180)
@@ -363,7 +431,7 @@ def run(args: argparse.Namespace) -> None:
         with autocast(device_type=device.type, enabled=use_fp16):
             rho = model.density_branch(ft)
         rho_np = rho.squeeze().detach().float().cpu().numpy()
-        dash = _build_dashboard(frame_resized, rho_np, None,
+        dash = _build_dashboard(frame_resized, rho_np, None, None,
                                 history, threshold, 0.0, 0, None)
         if out_dir:
             cv2.imwrite(str(out_dir / "image_dashboard.png"), dash)
@@ -392,6 +460,7 @@ def run(args: argparse.Namespace) -> None:
             cur_tensor = _bgr_to_tensor(frame_resized, device)
 
             rho_np: Optional[np.ndarray] = None
+            u_np:   Optional[np.ndarray] = None
             P_np:   Optional[np.ndarray] = None
             p_max:  Optional[float] = None
 
@@ -399,6 +468,7 @@ def run(args: argparse.Namespace) -> None:
                 with autocast(device_type=device.type, enabled=use_fp16):
                     out = model(prev_tensor, cur_tensor)
                 rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
+                u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
                 P_np   = out["P"].squeeze().detach().float().cpu().numpy()
                 p_max  = float(P_np.max())
                 history.append(p_max)
@@ -414,7 +484,7 @@ def run(args: argparse.Namespace) -> None:
 
             display_frame = prev_resized if prev_resized is not None else frame_resized
             dash = _build_dashboard(
-                display_frame, rho_np, P_np, history, threshold,
+                display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max,
             )
 
