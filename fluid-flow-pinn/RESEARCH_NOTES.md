@@ -19,9 +19,16 @@
    - [Step 6: Continuity Loss](#step-6-continuity-loss)
    - [Step 7: Branch 3 — Pressure Map + Total Loss](#step-7-branch-3--pressure-map--total-loss)
    - [Step 8: Full PINN Model](#step-8-full-pinn-model)
-6. [Datasets](#6-datasets)
-7. [Design Decisions Log](#7-design-decisions-log)
-8. [Open Questions](#8-open-questions)
+6. [Phase 3 — Inference, Pretrained Weights, Live Dashboard](#6-phase-3--inference-pretrained-weights-live-dashboard)
+   - [Step 9: First training run — diagnosing broken outputs](#step-9-first-training-run--diagnosing-broken-outputs)
+   - [Step 10: Switching to pretrained ShanghaiTech CSRNet](#step-10-switching-to-pretrained-shanghaitech-csrnet)
+   - [Step 11: Architectural fixes uncovered while wiring pretrained weights](#step-11-architectural-fixes-uncovered-while-wiring-pretrained-weights)
+   - [Step 12: Inference-only pipeline (no training required)](#step-12-inference-only-pipeline-no-training-required)
+   - [Step 13: Realtime dashboard — `infer.py`](#step-13-realtime-dashboard--inferpy)
+   - [Step 14: Field findings on dense scenes — perspective bias](#step-14-field-findings-on-dense-scenes--perspective-bias)
+7. [Datasets](#7-datasets)
+8. [Design Decisions Log](#8-design-decisions-log)
+9. [Open Questions](#9-open-questions)
 
 ---
 
@@ -166,10 +173,13 @@ Three reasons:
 2. **Transfer learning.** ImageNet-pretrained VGG-16 weights give the model strong low/mid-level visual features (edges, textures, object parts) from day one. Training from scratch on FDST's ~9,000 frames would severely underfit.
 3. **Right output stride.** The first 10 VGG-16 layers (up to pool3) produce a feature map at 1/8 the input resolution — exactly what we need to match with RAFT's downsampled flow output. This resolution is a constraint from the physics loss: both `ρ` and `u` must be on the same spatial grid.
 
-**Why the first 17 VGG-16 layers?**
-Layers 0–16 include conv1_1 through pool3 (three max-pool operations → stride 8). We stop here because:
+**Why the first 23 VGG-16 layers (not 17)?**
+*Note: the original implementation took layers `[:17]` (ending at pool3, 256 channels). This was an architectural bug — see [Step 11](#step-11-architectural-fixes-uncovered-while-wiring-pretrained-weights) for the fix and the canonical layer-index breakdown.*
+
+Layers 0–22 include conv1_1 through conv4_3 (three max-pool operations + the conv4 block → stride 8 with 512 channels). We stop here because:
 - Further VGG pooling (pool4, pool5) would reduce spatial resolution to 1/32, making the density map too coarse to localise crowd pressure spatially.
 - The dilated convolution backend replaces those deeper VGG layers with rate-2 dilations, which grow the receptive field without losing resolution.
+- The original CSRNet paper and the public reference implementation both end the frontend at conv4_3, producing 512-channel features at 1/8 resolution.
 
 **Why dilated convolutions in the backend?**
 Standard convolutions with stride > 1 reduce spatial resolution. Dilated (atrous) convolutions increase the receptive field exponentially without downsampling — the filter "skips" pixels by the dilation rate. With rate=2 and a 3×3 kernel, the effective receptive field is 5×5 per layer. Six such layers give a receptive field large enough to see a full person cluster while keeping the output at H/8 resolution. This is the core insight of CSRNet over earlier crowd counting models.
@@ -437,8 +447,10 @@ Two VRAM-saving mechanisms are active by default:
 
 FP16 is **not** managed inside `FluidFlowPINN`. It is applied externally via `torch.cuda.amp.autocast()` in the training loop. This is the standard PyTorch AMP pattern — the model itself stays in FP32 and AMP selectively casts operations.
 
-**Why not freeze CSRNet too?**
-CSRNet needs to be fine-tuned on FDST to produce accurate density maps for our specific dataset and camera angles. The pretrained VGG-16 weights in the frontend give a warm start, but the dilated backend and density head are randomly initialised and must be trained. RAFT is frozen because it already produces high-quality flow vectors without fine-tuning, and FDST has no flow ground truth to fine-tune against.
+**Why not freeze CSRNet too?** *(original reasoning, since superseded — see [Step 10](#step-10-switching-to-pretrained-shanghaitech-csrnet))*
+CSRNet was originally planned to be fine-tuned on FDST to produce accurate density maps for our specific dataset and camera angles. The pretrained VGG-16 weights in the frontend gave a warm start, but the dilated backend and density head were randomly initialised and intended to be trained. RAFT was frozen because it already produces high-quality flow vectors without fine-tuning, and FDST has no flow ground truth to fine-tune against.
+
+**Update — CSRNet is now frozen too in the MVP path.** The from-scratch training run produced uniform-noise ρ ([Step 9](#step-9-first-training-run--diagnosing-broken-outputs)). We switched to pretrained ShanghaiTech_A weights and freeze the entire density branch. With both branches frozen and PressureMap having zero learnable parameters, training is currently a no-op — the inference pipeline (`infer.py`) is the only execution path that runs day-to-day.
 
 #### Output contract
 
@@ -453,13 +465,197 @@ CSRNet needs to be fine-tuned on FDST to produce accurate density maps for our s
 
 ---
 
-## 6. Datasets
+## 6. Phase 3 — Inference, Pretrained Weights, Live Dashboard
+
+This phase covers the work after the initial training run produced unusable outputs. The chronology matters: each step here was driven by a concrete failure observed in dashboards or evaluation, not by upfront design.
+
+### Step 9: First training run — diagnosing broken outputs
+
+**Symptoms observed in `outputs/vis/` after a full FDST training run:**
+
+- `Predicted density ρ` panel showed values in `[-0.025, +0.025]` — uniform noise across the entire frame. Sum ≈ 20.6 vs. GT count 18.0 (matched only because a near-uniform field times the area integrates to ~anything).
+- Negative ρ values — physically meaningless; nothing in the model prevented them.
+- `Pressure timeline` had no dynamic range — baseline 1.0–1.5 with threshold at 0.5, so every frame fired ALARM. Var(u) values up to ~1400 dominated the signal; without a working ρ, P ≈ Var(u).
+
+**Root-cause analysis of the count metric:**
+
+`L_count = MSE(sum(ρ), GT_count)` is a **scalar** loss — it pushes the integral toward the right number but says nothing about *spatial structure*. A network that outputs a uniform constant `c = GT_count / (H·W)` everywhere achieves zero count loss while learning nothing about heads. With ~9k FDST frames and only this scalar signal driving the density head, that's the local minimum the model fell into.
+
+The motion + physics losses are designed to add spatial structure on top of the count term, but they couple ρ to RAFT's frozen flow — so they only work *if ρ is already approximately correct*. A degenerate uniform ρ doesn't get pulled out of the bad minimum by either signal.
+
+**Decision: stop trying to train CSRNet from scratch.** Switch to pretrained ShanghaiTech weights, where the spatial structure has already been learned on a much larger labeled dataset.
+
+### Step 10: Switching to pretrained ShanghaiTech CSRNet
+
+**Source chosen:** `CommissarMa/CSRNet-pytorch` ShanghaiTech Part_A weights — Part_A is the dense subset (avg ~500 heads/image, heavy occlusion) closest to the stampede regime we ultimately care about. Part_B (sparser street scenes) was rejected for the primary use case but kept as a fallback option for sparse footage.
+
+**The reasoning about training under freeze:**
+
+A natural question came up: *if we freeze CSRNet, what gets trained for pressure?* Answer: **nothing.** The three branches:
+
+| Branch | Trainable? | Why |
+|---|---|---|
+| 1. CSRNet | frozen with pretrained weights | the only branch with real learnable params for our task |
+| 2. RAFT | frozen by default | pretrained flow already strong; FDST has no flow GT |
+| 3. PressureMap | **has zero parameters** | `P = ρ · local_var(u)` is a pure analytic operator |
+
+`L_pressure` does not exist. There is no supervisory signal on P because we have no labeled anomaly data. With CSRNet frozen and RAFT frozen, the optimizer has nothing to update — `train.py` becomes a no-op. The correct workflow is therefore **inference-only**: load pretrained CSRNet + frozen RAFT, run `P = ρ · Var(u)` deterministically, and validate visually.
+
+**`use_count_loss` flag added** to `TotalLoss`. When the density branch is frozen, the count loss is computed under `torch.no_grad()` so it appears in the metrics dict for logging but contributes no gradient (the optimizer wouldn't be able to use it anyway, and including it in the total inflates the reported number for no reason). Auto-disabled in `train.py` whenever `freeze_density=True`.
+
+### Step 11: Architectural fixes uncovered while wiring pretrained weights
+
+Loading the ShanghaiTech checkpoint exposed three architectural bugs in our CSRNet that had been silently degrading the from-scratch training run.
+
+**Bug A — wrong VGG-16 frontend depth (the major one).**
+
+Original code took `vgg.features[:17]`, ending at `pool3` with **256 output channels**. The CSRNet paper, and CommissarMa's reference, take the frontend through `conv4_3` — **512 output channels**, still at 1/8 spatial resolution. The backend's first dilated conv was therefore being fed half the expected feature dimensionality, with `in_channels=256` instead of 512. Even from-scratch training would have been crippled by this.
+
+| | Old (broken) | Fixed |
+|---|---|---|
+| frontend slice | `vgg.features[:17]` | `vgg.features[:23]` |
+| frontend out channels | 256 | 512 |
+| backend `in_channels` | 256 | 512 |
+
+Inspecting `torchvision.vgg16().features` confirmed the canonical layer indices:
+
+```
+features[16] : MaxPool2d   ← pool3 (1/8 res, 256ch)
+features[17] : Conv2d 512  ← conv4_1
+features[18] : ReLU
+features[19] : Conv2d 512  ← conv4_2
+features[20] : ReLU
+features[21] : Conv2d 512  ← conv4_3
+features[22] : ReLU        ← end of [:23]
+features[23] : MaxPool2d   ← pool4 (1/16 — we don't want this)
+```
+
+**Bug B — output layer name mismatch.** Original code named the final 1×1 conv `density_head`. CommissarMa's checkpoints save it as `output_layer.*`. Renamed `density_head → output_layer` so ShanghaiTech `state_dict` keys load by name without manual remapping. Added `_remap_legacy_keys()` to also strip optional `module.` prefixes (DataParallel artifacts) and remap any older `density_head.*` keys saved before the rename.
+
+**Bug C — softplus on output (introduced and reverted).**
+
+To prevent negative ρ during from-scratch training, an initial fix wrapped the output in `F.softplus`. This worked for from-scratch training but **catastrophically miscalibrated the pretrained weights**:
+
+- Pretrained CSRNet was trained with no output activation. It produces small positive values on heads and ≈0 (sometimes slightly negative) elsewhere.
+- `softplus(0) = ln(2) ≈ 0.693`. Every "zero" pixel gets lifted to 0.693.
+- On a 135×240 density map, that's `32400 × 0.693 ≈ 22460` of phantom count from background alone.
+
+**Observed:** verification script reported predicted count = 22519 on a sparse scene with ~22 actual people — exactly the noise floor leaking through softplus.
+
+**Resolution:** replaced `softplus` with `F.relu`. ReLU preserves the pretrained calibration (floor stays at 0) while still preventing negative output values for any future from-scratch run. Lesson: non-negativity activations need to match the activation the original weights were trained under, not be added prophylactically.
+
+**Verification — bit-exact match against the reference:**
+
+A diagnostic script (`scripts/diff_csrnet_against_ref.py`) loads the same checkpoint into our `CSRNet` and a verbatim copy of CommissarMa's reference, then runs the same input through both. Result on the ShanghaiTech_A `.pth`:
+
+```
+[keys] ours=34  ref=34  shared=34
+[keys] all 34 shared params match exactly.
+ours  shape=(1, 1, 28, 28)  sum=0.2515  min=0.000000  max=0.003155
+ref   shape=(1, 1, 28, 28)  sum=0.0948  min=-0.002103  max=0.003155
+max |ours - relu(ref)| = 0.00e+00     (architectures match)
+```
+
+Bit-exact. Architecture is correct after the three fixes; any further oddities are data/domain issues, not implementation bugs.
+
+**Other small items resolved on the way:**
+
+- `torch.load(..., weights_only=True)` is the PyTorch 2.6 default and rejects checkpoints with non-tensor metadata. Set `weights_only=False` in `load_csrnet` because the third-party ShanghaiTech `.pth` pickles optimizer state alongside the weights.
+- The state_dict unwrap loop accepts `model`, `state_dict`, or `model_state_dict` wrapper keys to handle the various save conventions.
+
+### Step 12: Inference-only pipeline (no training required)
+
+Given that nothing is trainable when both upstream branches are frozen, the inference path doesn't need a `best.pt` training checkpoint. `infer.py` accepts **either** a full training checkpoint **or** a raw ShanghaiTech CSRNet `.pth`:
+
+```bash
+# Inference with pretrained weights only — no training step
+python infer.py --csrnet-weights /path/PartAmodel_best.pth \
+    --source clip.mp4 --out-dir outputs/infer_run/
+
+# Or, if a training checkpoint exists
+python infer.py --checkpoint checkpoints/best.pt \
+    --source clip.mp4 --out-dir outputs/infer_run/
+```
+
+Internally, the `--csrnet-weights` path constructs a `FluidFlowPINN(csrnet_weights=..., freeze_density=True, raft_frozen=True)` directly. RAFT auto-downloads pretrained `C_T_V2` weights from torchvision the first time. PressureMap has no params. The whole model is deterministic at inference.
+
+This is the **MVP path**: pretrained CSRNet + pretrained RAFT + analytic pressure → realtime dashboard, no labels needed, no gradient descent involved. Threshold calibration is a downstream concern (data-driven — pick from the percentile distribution of `max(P)` on a normal video — not a hand-picked guess).
+
+### Step 13: Realtime dashboard — `infer.py`
+
+**File:** `infer.py` (root of repo)
+
+A single script with two modes that both write the same artifacts:
+
+- **File output mode** (always on when `--out-dir` is set): writes `dashboard.mp4` (annotated frame-by-frame) and `pressure_timeline.png` (full P(t) curve).
+- **Live window mode** (`--display` flag): also opens an OpenCV window showing the dashboard updating in realtime. Press `q` or `Esc` to quit. Headless-safe — falls back to file-only when `--display` is omitted, so it works on cluster nodes without X.
+
+**Sources supported:** video file (`.mp4`/`.avi`/`.mov`/...), single image (`.jpg`/`.png` — only ρ, since P needs two frames), or webcam (`--source 0`).
+
+**Dashboard layout (final, after Step 14 expansion):**
+
+```
+┌───────────┬───────────┐
+│   input   │  rho      │   row 1 — what the scene contains
+├───────────┼───────────┤
+│ |u| with  │  Var(u)   │   row 2 — the motion factors
+│ arrows    │           │
+├───────────┼───────────┤
+│   P       │  status   │   row 3 — combined output + ALARM/OK panel
+├───────────┴───────────┤
+│  P(t) live timeline   │   rolling sparkline + threshold line
+└───────────────────────┘
+```
+
+Each colored panel has an embedded label with the salient scalar (e.g. `rho sum=353.7`, `P max=30.2`). `|u|` overlays sparse yellow flow arrows (every 24 px) so direction is visible, not just magnitude. The status panel surfaces frame number, infer-fps (so you know what "realtime" means on the current hardware), max P, threshold, and history depth.
+
+**Helper utilities introduced:**
+
+- `_local_var_np(u, k)` — numpy version of `PressureMap`'s local variance, used to render the Var(u) panel for *visualization*. The actual P field shown comes from the model's own PressureMap, not this helper — the helper exists so the diagnostic panel matches what's inside P.
+- `_flow_arrows(frame, u, step, scale)` — sparse arrow overlay; scales flow by 8 to undo the H/8 → H/8-grid downsampling and the ÷8 in `RAFTFlow.forward`, so arrow lengths are in input-pixel units.
+- `_render_timeline_strip` — renders a matplotlib strip into a BGR ndarray for the bottom of the dashboard each frame.
+
+**Throughput:** ~2.2 fps observed on a Colab T4 with FP16 for 2320×1080 input. RAFT-Small is the bottleneck; CSRNet alone runs faster. A coarser `--width`/`--height` setting trades spatial resolution for higher fps if needed.
+
+### Step 14: Field findings on dense scenes — perspective bias
+
+**Scenario:** dashboard run on a real dense crowd video (station/festival, oblique camera angle with strong perspective). `maxP` ranged 26–102, mean 32; threshold of 0.5 was meaningless (every frame fired). The complaint after watching the dashboard wasn't "magnitude is too high" — it was **"pressure shows up at the wrong locations within the frame."**
+
+**Spatial bias observed:** P peaks were concentrated in the *back* of the scene (where heads are small in pixel space), with very little response in the *foreground row* of obviously-crowded people closer to the camera.
+
+**Why this happens — three stacking causes:**
+
+1. **Perspective / scale mismatch in CSRNet.** ShanghaiTech_A is trained on images where heads occupy a roughly uniform pixel size (stadium framing, no strong perspective). On a perspective scene, near-camera heads are *too big* — they don't match the network's expected head-feature scale, so CSRNet under-fires on them. Far-camera heads are correctly scaled and CSRNet fires strongly. **ρ is structurally biased toward distance.**
+
+2. **RAFT flow scales with screen-space velocity.** Same physical walking speed produces large `|u|` in the foreground (many pixels per frame) and small `|u|` in the back (few pixels per frame). But `Var(u)` measures local *disorder*, not magnitude. In the back, where many small heads are packed into a small image region with slightly different motion vectors, Var(u) is high. In the foreground, where one large person dominates the local window with one consistent flow vector, Var(u) is low.
+
+3. **Fixed-size variance window (5×5 on H/8 grid = 40×40 input pixels).** That window covers roughly *one foreground head* but *ten background heads*. Variance is naturally higher when more independent motion sources fit inside the window. The formula is structurally biased toward dense distant crowds.
+
+**Net effect:** `ρ_far · Var(u)_far ≫ ρ_near · Var(u)_near`. The bias is real and physical given the current formulation; it's not an implementation bug. Any single fix only addresses one of the three causes.
+
+**What the dashboard expansion (Step 13's row 2) was for:** before this diagnosis, only ρ and P were visible. We could see "P fires in the back" but not which factor (ρ vs. Var(u)) was responsible. Adding the `|u|` and `Var(u)` panels lets us attribute every P spike: if Var(u) is the dominant cause, the fix needs to address motion measurement; if ρ is missing in the foreground, the fix needs to address perspective in the density branch.
+
+**Three real options for fixing the bias** (deferred — none implemented yet):
+
+1. **Perspective normalization map.** Multiply ρ by a per-pixel scale map (head-size-at-depth) so foreground heads get amplified to compensate for CSRNet under-firing. Standard "perspective density map" approach (referenced in CommissarMa's tutorial repo). Needs a hand-drawn perspective map per camera.
+
+2. **Adaptive variance window.** Use a window size in *world-pixels*, not grid-cells — coarser in foreground, finer in back. Same effect as (1), but for the motion factor instead of density. Also needs a depth/perspective estimate.
+
+3. **Density gating: zero out P where ρ is below a small threshold.** Doesn't fix the bias toward distance, but kills hallucinated pressure on textured background regions where ρ is small but nonzero. Cheap and effective for non-stadium footage with empty regions; doesn't help here because the entire dense scene has high ρ.
+
+**Working theory for next iteration:** the pressure formula is correct as a relative score over time at a fixed location, but its *absolute* spatial distribution is unreliable on perspective scenes. Threshold calibration should therefore be **per-region** (or use a spatial normalization from a "normal" reference frame), not a single scalar across the whole image.
+
+**Status:** dashboard expanded (Step 13 layout), perspective fix deferred. Next planned step is to run the same dashboard on a top-down camera angle to confirm whether the bias disappears when perspective is removed — if yes, we have direct evidence that perspective is the cause and option 1 is the right fix.
+
+---
+
+## 7. Datasets
 
 | Dataset | Role | Split | Status |
 |---|---|---|---|
 | FDST | Primary training | train: 9 scenes, 60 videos / test: 4 scenes, 40 videos | ✅ Working |
 | UMN | Anomaly evaluation + lead-time | 3 scenes, 1 `.avi` | ⏳ Download pending |
-| ShanghaiTech A/B | Density branch evaluation | test only | ⏳ Download pending |
+| ShanghaiTech A/B | Pretrained CSRNet weights (Part_A used for inference) | weights only | ✅ Part_A loaded |
 | CrowdFlow | Flow branch evaluation | 5 synthetic sequences | Not started |
 | Venice | Perspective validation | 4 sequences | Not started |
 
@@ -477,7 +673,7 @@ FDST Dataset/
 
 ---
 
-## 7. Design Decisions Log
+## 8. Design Decisions Log
 
 | Decision | Alternative considered | Why we chose this |
 |---|---|---|
@@ -502,10 +698,20 @@ FDST Dataset/
 | Resolution filter checks both `frame_t` and `frame_t1` | Check only `frame_t` (original) | Original bug: pairs where `frame_t1` has a different resolution would pass the filter, causing shape mismatches or a broken temporal derivative `∂ρ/∂t`. Fixed to require both frames match the target resolution. |
 | CSRNet run twice per forward (frame_t and frame_t1) | Run once, reuse rho_t as rho_t1 | Both time steps are needed for `∂ρ/∂t`; weight sharing is free (same model, different inputs); reusing rho_t would make the temporal derivative always zero |
 | FP16 via external `autocast()`, not inside model | Cast tensors inside `forward()` | Standard PyTorch AMP pattern; keeps model portable and lets the training loop control precision scope |
+| VGG-16 frontend through `conv4_3` (`features[:23]`, 512ch) | Stop at pool3 (`features[:17]`, 256ch) — original buggy state | Canonical CSRNet (Li et al., CVPR 2018) and CommissarMa's reference both go through conv4_3. Stopping at pool3 halved the feature dimensionality at the backend's input and almost certainly contributed to the failed from-scratch training run. Required for ShanghaiTech checkpoint compatibility. |
+| Output-layer name `output_layer` (not `density_head`) | Custom name + key-remap loader | Matches CommissarMa/CSRNet-pytorch ShanghaiTech checkpoint keys directly; no remap needed. The `_remap_legacy_keys()` helper still handles the old `density_head.*` name and `module.*` (DataParallel) prefixes for any third-party checkpoint that uses them. |
+| `F.relu` on density output | `F.softplus` (tried, reverted), no activation | Softplus floor is `ln(2)≈0.693`, which adds ~22000 of phantom count over a 135×240 map. Pretrained ShanghaiTech weights expect a linear output. ReLU preserves the pretrained calibration (floor stays at 0) while still preventing negative values for any future from-scratch run. Lesson: non-negativity activations must match the activation the original weights were trained under. |
+| `torch.load(weights_only=False)` for CSRNet checkpoints | PyTorch 2.6 default `weights_only=True` | Third-party ShanghaiTech `.pth` files pickle non-tensor metadata (epoch, optimizer state). `weights_only=True` rejects them. Local files we control — safe to disable. |
+| `freeze_density` flag on `FluidFlowPINN` + `--freeze-density` CLI | Always train CSRNet | When loading pretrained ShanghaiTech weights, fine-tuning on FDST risks destroying the spatial structure those weights already encode. Freezing isolates debugging — if P(t) still looks broken with a known-good ρ, the problem is in flow or pressure, not density. |
+| `use_count_loss=False` when density is frozen | Always include `L_count` in total | When CSRNet is frozen, count loss is uninfluenceable — including it in the total just adds noise to the reported scalar without contributing a useful gradient. With `use_count_loss=False`, the term is computed under `torch.no_grad()` and stays in the metrics dict for logging only. Auto-disabled in `train.py` when `freeze_density=True`. |
+| Inference-only path (no training step) for the MVP | Train CSRNet from scratch on FDST | The first training run produced uniform-noise ρ ([Step 9](#step-9-first-training-run--diagnosing-broken-outputs)). Pretrained ShanghaiTech_A handles dense crowds well enough to use directly; PressureMap has zero learnable params; RAFT works frozen. With both upstream branches frozen, `train.py` is a no-op anyway. Inference-only ships an MVP today; training resumes only when (a) labeled anomaly data enables a pressure loss, or (b) we decide to fine-tune RAFT on crowd motion. |
+| ShanghaiTech Part_A weights as default | Part_B (sparser scenes), or train Part_A + Part_B ensemble | Part_A trains on dense crowds (~500 heads/image), which is exactly the regime where stampedes happen. Part_B (sparser, 9–578 heads) under-fires on dense scenes. Trade-off accepted: Part_A overcounts on out-of-distribution sparse scenes (cafeteria predicted ~124 vs. real ~22), but for stampede prediction the dense regime matters more. Part_B remains a documented fallback for sparse-only deployments. |
+| `infer.py` accepts both `--checkpoint` and `--csrnet-weights` | Require a full training checkpoint | Cluster users (with the ShanghaiTech `.pth`) shouldn't have to run a meaningless `train.py` first. Mutually exclusive flags; exactly one must be specified. Keeps the inference path self-contained for the MVP. |
+| Six-pane dashboard (input, ρ, \|u\|+arrows, Var(u), P, status) + timeline strip | Original four-pane (input, ρ, P, status) | The four-pane layout couldn't tell us *why* P fired in any given location — was ρ wrong, was Var(u) wrong, or both? The expanded layout shows every factor in the formula `P = ρ · Var(u)` plus the raw flow field. Diagnostic value paid for itself the first time we used it (Step 14 perspective bias would have been guesswork without the Var(u) panel). |
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
 - [ ] Will the continuity residual `R` be meaningful at 1/8 resolution, or does downsampling smooth out the local compression signal?
 - [ ] UMN is 30fps at 320×240 — after bicubic upsample to 640×480, will RAFT produce usable flow vectors or will the upsampled frames introduce artifacts?
@@ -514,18 +720,9 @@ FDST Dataset/
 - [ ] Does the pressure map `P` need to be normalised before thresholding for the UMN lead-time evaluation, or can a fixed threshold be applied across scenes?
 - [ ] The full PINN model runs CSRNet twice per forward pass (frame_t and frame_t1). At batch size 4 on T4 with FP16, does this double the activation memory footprint of the density branch, or does gradient checkpointing contain it?
 - [ ] ShanghaiTech Part A has images up to 3139 persons — will the Gaussian density maps with σ=15 px overlap too heavily at that density, creating a uniform blob instead of a meaningful map?
-
-
-Why P is biased toward distant regions
-Three things stack:
-
-1. Perspective / scale mismatch. People near the camera occupy ~100 pixels per head; people in the back occupy ~10 pixels per head. ShanghaiTech_A was trained on images where heads are uniformly small (stadium-style framing). On your perspective scene:
-
-Near-camera people are too big — CSRNet under-fires on them (large blobs don't match its expected head scale). You can see this in the ρ panel: the foreground row of people barely lights up.
-Far-away people are correctly scaled and CSRNet fires strongly on them. ρ is densest in the back.
-2. RAFT flow magnitude scales with screen-space velocity. A person walking at 1 m/s in the foreground covers many pixels per frame (high |u|). A person walking the same speed in the back covers very few pixels per frame (low |u|). But Var(u) — the variance of flow — measures local disorder, not magnitude. In the back, where there are many heads in a small area moving in slightly different directions, Var(u) is high. In the foreground, where one big person dominates the local window, Var(u) is low (one consistent flow vector across the head).
-
-3. The variance window is fixed-size in pixels. A 5×5 window on the H/8 grid covers a 40×40 input-pixel region — that's roughly one foreground head but ten background heads. Variance is naturally higher when more independent motion sources fit inside the window. So the formula is structurally biased toward distant crowds.
-
-The combination: ρ_far is high, Var(u)_far is high, P_far = high. ρ_near is low, Var(u)_near is low, P_near = low. The bias you're seeing is real and physical — distant crowds genuinely have more measurable disorder per pixel.
-
+- [ ] How do we calibrate the pressure threshold from data instead of guessing? Plan: run inference over a "normal" video, compute the percentile distribution of `max(P)`, set threshold at the 95–99th percentile. Per-camera or universal?
+- [ ] Will the perspective bias from [Step 14](#step-14-field-findings-on-dense-scenes--perspective-bias) disappear on top-down camera angles, confirming that perspective is the dominant cause? (Test by running `infer.py` on a top-down clip and comparing the spatial distribution of P.)
+- [ ] If perspective normalization is needed, can we estimate the perspective map automatically from a few minutes of pedestrian-tracking footage (heads-as-features) instead of requiring a hand-drawn calibration per camera?
+- [ ] ShanghaiTech_A overcounts on sparse out-of-distribution scenes (cafeteria: 124 predicted vs. ~22 real, ~5.6×). For deployments that mix sparse and dense regimes, do we need both Part_A and Part_B weights, or a scene-classifier in front that picks?
+- [ ] PressureMap has zero learnable parameters today. If we ever get labeled anomaly data, should the next learnable component sit (a) inside PressureMap as a refinement head over `[ρ, u, P]`, or (b) as a separate Branch 4 that consumes the deterministic P and predicts a calibrated risk score?
+- [ ] RAFT was trained on Sintel/KITTI (cars, scenes). It may smooth flow across small heads in dense crowds, suppressing the per-head Var(u) signal. Worth fine-tuning RAFT on crowd footage with the warp-consistency + continuity losses (would unfreeze the only other parameter-bearing branch)?
