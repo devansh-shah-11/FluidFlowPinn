@@ -514,3 +514,18 @@ FDST Dataset/
 - [ ] Does the pressure map `P` need to be normalised before thresholding for the UMN lead-time evaluation, or can a fixed threshold be applied across scenes?
 - [ ] The full PINN model runs CSRNet twice per forward pass (frame_t and frame_t1). At batch size 4 on T4 with FP16, does this double the activation memory footprint of the density branch, or does gradient checkpointing contain it?
 - [ ] ShanghaiTech Part A has images up to 3139 persons — will the Gaussian density maps with σ=15 px overlap too heavily at that density, creating a uniform blob instead of a meaningful map?
+
+
+Why P is biased toward distant regions
+Three things stack:
+
+1. Perspective / scale mismatch. People near the camera occupy ~100 pixels per head; people in the back occupy ~10 pixels per head. ShanghaiTech_A was trained on images where heads are uniformly small (stadium-style framing). On your perspective scene:
+
+Near-camera people are too big — CSRNet under-fires on them (large blobs don't match its expected head scale). You can see this in the ρ panel: the foreground row of people barely lights up.
+Far-away people are correctly scaled and CSRNet fires strongly on them. ρ is densest in the back.
+2. RAFT flow magnitude scales with screen-space velocity. A person walking at 1 m/s in the foreground covers many pixels per frame (high |u|). A person walking the same speed in the back covers very few pixels per frame (low |u|). But Var(u) — the variance of flow — measures local disorder, not magnitude. In the back, where there are many heads in a small area moving in slightly different directions, Var(u) is high. In the foreground, where one big person dominates the local window, Var(u) is low (one consistent flow vector across the head).
+
+3. The variance window is fixed-size in pixels. A 5×5 window on the H/8 grid covers a 40×40 input-pixel region — that's roughly one foreground head but ten background heads. Variance is naturally higher when more independent motion sources fit inside the window. So the formula is structurally biased toward distant crowds.
+
+The combination: ρ_far is high, Var(u)_far is high, P_far = high. ρ_near is low, Var(u)_near is low, P_near = low. The bias you're seeing is real and physical — distant crowds genuinely have more measurable disorder per pixel.
+
