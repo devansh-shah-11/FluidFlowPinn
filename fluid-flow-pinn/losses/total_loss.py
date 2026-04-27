@@ -48,6 +48,10 @@ class TotalLoss(nn.Module):
         lambda1: weight for the motion loss term.
         lambda2: weight for the physics (continuity) loss term.
         fps:     frames-per-second used for the temporal derivative in R.
+        use_count_loss: if False, L_count is reported as a diagnostic metric
+                        (no grad) but excluded from the total. Set this when
+                        the density branch is frozen so the optimizer doesn't
+                        chase a term it can't influence.
     """
 
     def __init__(
@@ -55,10 +59,12 @@ class TotalLoss(nn.Module):
         lambda1: float = 0.1,
         lambda2: float = 0.01,
         fps: float = 30.0,
+        use_count_loss: bool = True,
     ) -> None:
         super().__init__()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
+        self.use_count_loss = use_count_loss
         self.continuity = ContinuityLoss(fps=fps)
 
     def forward(
@@ -80,10 +86,17 @@ class TotalLoss(nn.Module):
         Returns:
             dict with keys: 'total', 'count', 'motion', 'physics'
         """
-        # L_count: MSE between predicted count (sum of density map) and GT count
-        pred_count = rho_t.sum(dim=(1, 2, 3))          # (B,)
+        # L_count: MSE between predicted count (sum of density map) and GT count.
+        # When use_count_loss=False (e.g. CSRNet frozen), compute it under no_grad
+        # so it stays in the metrics dict for logging but contributes no gradient.
         gt_count = gt_count.view(-1).float()            # (B,)
-        l_count = nn.functional.mse_loss(pred_count, gt_count)
+        if self.use_count_loss:
+            pred_count = rho_t.sum(dim=(1, 2, 3))      # (B,)
+            l_count = nn.functional.mse_loss(pred_count, gt_count)
+        else:
+            with torch.no_grad():
+                pred_count = rho_t.sum(dim=(1, 2, 3))
+                l_count = nn.functional.mse_loss(pred_count, gt_count)
 
         # L_motion: EPE when GT flow is available; else density warp consistency
         if gt_flow is not None:
@@ -100,7 +113,9 @@ class TotalLoss(nn.Module):
         # L_physics: ||R||² continuity residual
         l_physics = self.continuity(rho_t, rho_t1, u)
 
-        total = l_count + self.lambda1 * l_motion + self.lambda2 * l_physics
+        total = self.lambda1 * l_motion + self.lambda2 * l_physics
+        if self.use_count_loss:
+            total = total + l_count
 
         return {
             "total":   total,

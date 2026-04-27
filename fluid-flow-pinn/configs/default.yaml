@@ -18,7 +18,8 @@ output:
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  csrnet_weights: null          # path to local .pth, or null to download
+  csrnet_weights: null          # path to ShanghaiTech-pretrained CSRNet .pth, or null
+  freeze_density: true         # freeze CSRNet entirely (use when csrnet_weights is trusted)
   raft_weights: null            # path to local .pth, or null to download
   pressure_window: 5            # local spatial window (px) for Var(u) in Branch 3
   use_fp16: true

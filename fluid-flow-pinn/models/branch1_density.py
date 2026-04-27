@@ -5,22 +5,21 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from torchvision import models
 
 
 # ── VGG-16 frontend (shared backbone) ────────────────────────────────────────
-# VGG-16 feature layer indices:
-#   0-4  : conv1_1, relu, conv1_2, relu, pool1  → 64ch,  H/2
-#   5-9  : conv2_1, relu, conv2_2, relu, pool2  → 128ch, H/4
-#  10-16 : conv3_1, relu, conv3_2, relu, conv3_3, relu, pool3 → 256ch, H/8
-# We need layers[:17] to reach pool3: 256 channels at 1/8 resolution.
-_VGG16_FRONTEND_LAYERS = 17
+# Canonical CSRNet (Li et al., CVPR 2018) uses VGG-16 up through conv4_3 —
+# that's 10 conv layers + 3 max-pools, ending at 512 channels at 1/8 resolution.
+# In torchvision's VGG-16, the conv4_3 ReLU sits at index 22, so we take [:23].
+_VGG16_FRONTEND_LAYERS = 23
 
 
 # ── Dilated convolution backend ───────────────────────────────────────────────
 # Six 3×3 dilated conv layers replace the remaining VGG pooling stages.
-# Dilation rates follow the original CSRNet paper (Li et al., CVPR 2018).
+# Dilation rates follow the original CSRNet paper.
 _BACKEND_CFG = [
     # (out_channels, dilation)
     (512, 2),
@@ -36,9 +35,11 @@ class CSRNet(nn.Module):
     """CSRNet: dilated convolutional neural network for crowd counting.
 
     Architecture (Li et al., CVPR 2018):
-      Frontend : VGG-16 conv1_1 … pool3  → (B, 512, H/8, W/8)
-      Backend  : 6× dilated conv (rate=2) → (B, 64,  H/8, W/8)
-      Head     : 1×1 conv                 → (B, 1,   H/8, W/8)  density map ρ
+      Frontend : VGG-16 conv1_1 … conv4_3 → (B, 512, H/8, W/8)
+      Backend  : 6× dilated conv (rate=2) → (B,  64, H/8, W/8)
+      Output   : 1×1 conv                 → (B,   1, H/8, W/8) density map ρ
+
+    The output is passed through softplus so density is non-negative.
 
     Input : (B, 3, H, W)  ImageNet-normalised RGB
     Output: (B, 1, H/8, W/8)  density map ρ  (sum ≈ person count)
@@ -48,15 +49,15 @@ class CSRNet(nn.Module):
         super().__init__()
         self.use_grad_checkpoint = use_grad_checkpoint
 
-        # Frontend: first 10 layers of VGG-16 (up to and including pool3)
+        # Frontend: VGG-16 conv1_1 … conv4_3
         vgg = models.vgg16(weights=None)
         self.frontend = nn.Sequential(
             *list(vgg.features.children())[:_VGG16_FRONTEND_LAYERS]
         )
 
-        # Backend: dilated convolutions
+        # Backend: dilated convolutions. conv4_3 outputs 512 channels.
         layers = []
-        in_ch = 256  # VGG-16 pool3 outputs 256 channels
+        in_ch = 512
         for out_ch, dilation in _BACKEND_CFG:
             layers += [
                 nn.Conv2d(in_ch, out_ch, kernel_size=3,
@@ -66,22 +67,21 @@ class CSRNet(nn.Module):
             in_ch = out_ch
         self.backend = nn.Sequential(*layers)
 
-        # Density head: 1×1 conv → single-channel density map
-        self.density_head = nn.Conv2d(64, 1, kernel_size=1)
+        # Output: 1×1 conv → single-channel density map.
+        # Named `output_layer` to match CommissarMa/CSRNet-pytorch checkpoints.
+        self.output_layer = nn.Conv2d(64, 1, kernel_size=1)
 
         self._init_weights(vgg)
 
     def _init_weights(self, vgg: models.VGG) -> None:
         """Copy pretrained VGG-16 weights into frontend; kaiming-init backend."""
-        # Frontend — copy from pretrained VGG
         vgg_children = list(vgg.features.children())
         for dst, src in zip(self.frontend.children(), vgg_children[:_VGG16_FRONTEND_LAYERS]):
             if isinstance(dst, nn.Conv2d) and isinstance(src, nn.Conv2d):
                 dst.weight.data.copy_(src.weight.data)
                 dst.bias.data.copy_(src.bias.data)
 
-        # Backend + head — kaiming uniform
-        for m in list(self.backend.modules()) + list(self.density_head.modules()):
+        for m in list(self.backend.modules()) + [self.output_layer]:
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
@@ -92,43 +92,66 @@ class CSRNet(nn.Module):
         Args:
             x: (B, 3, H, W) ImageNet-normalised RGB frames.
         Returns:
-            rho: (B, 1, H/8, W/8) density map.
+            rho: (B, 1, H/8, W/8) non-negative density map.
         """
         if self.use_grad_checkpoint and self.training:
             x = checkpoint.checkpoint(self.frontend, x, use_reentrant=False)
         else:
             x = self.frontend(x)
         x = self.backend(x)
-        return self.density_head(x)
+        x = self.output_layer(x)
+        return F.softplus(x)
+
+    def freeze(self) -> None:
+        """Freeze all parameters — use after loading pretrained weights."""
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
 
 
 # ── Weight loading ────────────────────────────────────────────────────────────
+
+def _remap_legacy_keys(state: dict) -> dict:
+    """Map alternative key names found in third-party CSRNet checkpoints."""
+    remapped = {}
+    for k, v in state.items():
+        # Legacy `density_head.*` from earlier versions of this repo
+        if k.startswith("density_head."):
+            k = k.replace("density_head.", "output_layer.", 1)
+        # Some checkpoints save under a `module.` prefix (DataParallel)
+        if k.startswith("module."):
+            k = k[len("module."):]
+        remapped[k] = v
+    return remapped
+
 
 def load_csrnet(
     weights_path: Optional[str | Path] = None,
     use_grad_checkpoint: bool = False,
     pretrained_vgg: bool = True,
+    freeze: bool = False,
 ) -> CSRNet:
     """Build a CSRNet and optionally load weights.
 
     Args:
         weights_path: Path to a `.pth` checkpoint saved as a state_dict.
-                      If None, the model is initialised with ImageNet VGG-16
-                      weights in the frontend (downloaded automatically on
-                      first call when pretrained_vgg=True).
+                      Compatible with CommissarMa/CSRNet-pytorch ShanghaiTech
+                      checkpoints. If None, the model is initialised with
+                      ImageNet VGG-16 weights in the frontend.
         use_grad_checkpoint: Enable gradient checkpointing on the frontend
                              to reduce VRAM usage during training.
         pretrained_vgg: When weights_path is None, initialise the frontend
-                        from the official torchvision VGG-16 pretrained weights.
+                        from ImageNet VGG-16 weights.
+        freeze: Freeze all CSRNet parameters after loading. Use this when
+                you trust the pretrained weights and only want to learn the
+                flow / pressure branches.
 
     Returns:
         CSRNet instance with weights loaded.
     """
     if pretrained_vgg and weights_path is None:
-        # Load ImageNet-pretrained VGG-16 just to copy its weights
         vgg_pretrained = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         model = CSRNet(use_grad_checkpoint=use_grad_checkpoint)
-        # Re-copy with pretrained weights (overrides kaiming init in frontend)
         vgg_children = list(vgg_pretrained.features.children())
         for dst, src in zip(
             model.frontend.children(),
@@ -142,10 +165,21 @@ def load_csrnet(
 
     if weights_path is not None:
         state = torch.load(weights_path, map_location="cpu")
-        # Handle checkpoints saved as {"model": state_dict, ...}
-        if isinstance(state, dict) and "model" in state:
-            state = state["model"]
-        model.load_state_dict(state, strict=False)
+        if isinstance(state, dict):
+            for wrap_key in ("model", "state_dict", "model_state_dict"):
+                if wrap_key in state and isinstance(state[wrap_key], dict):
+                    state = state[wrap_key]
+                    break
+        state = _remap_legacy_keys(state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[CSRNet] Loaded weights from {weights_path}")
+        if missing:
+            print(f"[CSRNet] missing keys: {len(missing)} (e.g. {missing[:3]})")
+        if unexpected:
+            print(f"[CSRNet] unexpected keys: {len(unexpected)} (e.g. {unexpected[:3]})")
+
+    if freeze:
+        model.freeze()
+        print("[CSRNet] Frozen — density branch will not be trained.")
 
     return model

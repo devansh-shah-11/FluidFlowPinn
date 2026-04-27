@@ -288,14 +288,19 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
         pressure_window=_cfg(cfg, "model", "pressure_window", default=5),
         csrnet_weights=_cfg(cfg, "model", "csrnet_weights"),
         raft_weights=_cfg(cfg, "model", "raft_weights"),
+        freeze_density=_cfg(cfg, "model", "freeze_density", default=False),
     ).to(device)
 
     # ── Loss ──────────────────────────────────────────────────────────────────
+    freeze_density = _cfg(cfg, "model", "freeze_density", default=False)
     criterion = TotalLoss(
         lambda1=_cfg(cfg, "training", "lambda1", default=0.1),
         lambda2=_cfg(cfg, "training", "lambda2", default=0.01),
         fps=float(_cfg(cfg, "preprocessing", "fps", default=30)),
+        use_count_loss=not freeze_density,
     ).to(device)
+    if freeze_density:
+        log.info("Density branch frozen — count loss reported as metric only.")
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     lr           = _cfg(cfg, "training", "lr", default=1e-4)
@@ -521,6 +526,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir",           default=None, help="Override output.checkpoints directory")
     p.add_argument("--resume",                   default=None, help="Path to checkpoint to resume from")
     p.add_argument("--no-fp16", action="store_true",           help="Disable FP16 mixed precision")
+    p.add_argument("--csrnet-weights",            default=None, help="Path to pretrained CSRNet .pth (ShanghaiTech)")
+    p.add_argument("--freeze-density", action="store_true",    help="Freeze CSRNet (no gradients to density branch)")
     return p.parse_args()
 
 
@@ -547,6 +554,10 @@ def main() -> None:
         cfg.setdefault("output", {})["checkpoints"] = args.checkpoint_dir
     if args.no_fp16:
         cfg.setdefault("model", {})["use_fp16"] = False
+    if args.csrnet_weights is not None:
+        cfg.setdefault("model", {})["csrnet_weights"] = args.csrnet_weights
+    if args.freeze_density:
+        cfg.setdefault("model", {})["freeze_density"] = True
 
     train(cfg, args)
 

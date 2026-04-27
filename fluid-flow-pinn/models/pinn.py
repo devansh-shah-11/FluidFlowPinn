@@ -38,6 +38,7 @@ class FluidFlowPINN(nn.Module):
         pressure_window: int = 5,
         csrnet_weights: Optional[str | Path] = None,
         raft_weights: Optional[str | Path] = None,
+        freeze_density: bool = False,
     ) -> None:
         super().__init__()
 
@@ -45,6 +46,7 @@ class FluidFlowPINN(nn.Module):
             weights_path=csrnet_weights,
             use_grad_checkpoint=use_grad_checkpoint,
             pretrained_vgg=(csrnet_weights is None),
+            freeze=freeze_density,
         )
 
         self.flow_branch = load_raft(
