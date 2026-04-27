@@ -252,6 +252,86 @@ def _denoise_flow(
     return out
 
 
+def _multiscale_density(
+    model,
+    frame_bgr: np.ndarray,
+    device: torch.device,
+    use_fp16: bool,
+    scales: tuple,
+    target_hw: tuple,
+) -> np.ndarray:
+    """Test-time multi-scale CSRNet, fused per-pixel by max.
+
+    CSRNet's effective receptive field is fixed; in scenes with strong
+    perspective, far heads are too small and near heads are too big for the
+    single training scale. Running at multiple input scales catches heads of
+    different apparent sizes; per-pixel max keeps whichever scale lit up.
+
+    Args:
+        model: FluidFlowPINN (uses model.density_branch).
+        frame_bgr: original BGR frame at inference resolution (Hi, Wi, 3).
+        scales: tuple of float scale factors, e.g. (0.5, 1.0, 2.0).
+        target_hw: (H_out, W_out) — the H/8, W/8 grid where rho lives.
+
+    Returns:
+        rho_np: (H_out, W_out) fused density on the H/8 grid.
+    """
+    Hi, Wi = frame_bgr.shape[:2]
+    H_out, W_out = target_hw
+    fused = np.zeros((H_out, W_out), dtype=np.float32)
+
+    for s in scales:
+        # Snap scaled dims to multiples of 8 so /8 alignment holds.
+        h_s = max(8, ((int(round(Hi * s))) // 8) * 8)
+        w_s = max(8, ((int(round(Wi * s))) // 8) * 8)
+        f_s = cv2.resize(frame_bgr, (w_s, h_s), interpolation=cv2.INTER_LINEAR)
+        t = _bgr_to_tensor(f_s, device)
+        with autocast(device_type=device.type, enabled=use_fp16):
+            rho = model.density_branch(t)
+        rho_np = rho.squeeze().detach().float().cpu().numpy()
+        # Counts must be preserved when resizing a density map: scale by
+        # area ratio so that sum(rho) is invariant to resampling.
+        src_h, src_w = rho_np.shape
+        if (src_h, src_w) != (H_out, W_out):
+            area_ratio = (H_out * W_out) / float(src_h * src_w)
+            rho_np = cv2.resize(rho_np, (W_out, H_out), interpolation=cv2.INTER_LINEAR)
+            rho_np = rho_np * area_ratio
+        fused = np.maximum(fused, rho_np)
+    return fused
+
+
+def _aggregate_pressure(
+    P_np: np.ndarray,
+    rho_np: np.ndarray,
+    mode: str,
+    topk_frac: float,
+) -> float:
+    """Reduce a P map to a single scalar danger score.
+
+    Modes:
+        max           — original; max(P). Brittle to single-pixel artifacts.
+        topk          — mean of top-k fraction of pixels. Robust to spikes.
+        weighted_mean — sum(rho * P) / sum(rho). "Pressure on an average
+                        person" — naturally suppresses lone-pixel hot spots
+                        in low-density regions because they get tiny weight.
+    """
+    if mode == "max":
+        return float(P_np.max())
+    if mode == "topk":
+        flat = P_np.reshape(-1)
+        k = max(1, int(round(flat.size * topk_frac)))
+        # argpartition for the k largest, then mean
+        idx = np.argpartition(flat, -k)[-k:]
+        return float(flat[idx].mean())
+    if mode == "weighted_mean":
+        w = rho_np.astype(np.float32)
+        denom = float(w.sum())
+        if denom <= 1e-9:
+            return float(P_np.mean())
+        return float((w * P_np).sum() / denom)
+    raise ValueError(f"unknown p_agg mode: {mode}")
+
+
 def _temporal_ema(
     u_prev_ema: Optional[np.ndarray],
     u_cur: np.ndarray,
@@ -479,6 +559,17 @@ def run(args: argparse.Namespace) -> None:
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    ms_scales = None
+    if args.density_scales:
+        try:
+            ms_scales = tuple(float(s) for s in args.density_scales.split(","))
+        except ValueError:
+            log.error("--density-scales must be a comma list of floats, got %r",
+                      args.density_scales)
+            sys.exit(2)
+        log.info("Multi-scale CSRNet enabled: scales=%s (fused per-pixel by max)",
+                 ms_scales)
+
     if args.per_capita:
         p_formula = "Var(u) / (rho+eps)"
     elif args.rho_alpha == 1.0:
@@ -546,6 +637,15 @@ def run(args: argparse.Namespace) -> None:
                 rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
                 u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
 
+                # Test-time multi-scale CSRNet, fused per-pixel by max.
+                # Catches near-heads (downscale pass) and far-heads (upscale
+                # pass) that the single training scale misses.
+                if ms_scales is not None:
+                    rho_np = _multiscale_density(
+                        model, frame_resized, device, use_fp16,
+                        scales=ms_scales, target_hw=rho_np.shape,
+                    )
+
                 # Smooth u to suppress RAFT noise without introducing edges.
                 # Spatial Gaussian first, then temporal EMA across frames.
                 u_np = _denoise_flow(u_np, spatial_sigma=args.flow_spatial_sigma)
@@ -568,7 +668,9 @@ def run(args: argparse.Namespace) -> None:
                 else:
                     P_np = out["P"].squeeze().detach().float().cpu().numpy()
 
-                p_max  = float(P_np.max())
+                p_max = _aggregate_pressure(
+                    P_np, rho_np, mode=args.p_agg, topk_frac=args.topk_frac,
+                )
                 history.append(p_max)
                 all_scores.append(p_max)
             # On the first frame we have no pair yet — render the dashboard
@@ -668,6 +770,17 @@ def _parse_args() -> argparse.Namespace:
                         "Overrides --rho-alpha.")
     p.add_argument("--per-capita-eps", type=float, default=1e-3,
                    help="Epsilon in per-capita denominator (default 1e-3).")
+    # Multi-scale CSRNet — fix far/near head undercounting
+    p.add_argument("--density-scales", type=str, default=None,
+                   help="Comma list of input scales for multi-scale CSRNet, e.g. "
+                        "'0.5,1.0,2.0'. Fused per-pixel by max. Default: off.")
+    # Aggregator — how to reduce P-map to a scalar danger score
+    p.add_argument("--p-agg", choices=("max", "topk", "weighted_mean"),
+                   default="max",
+                   help="Reduce P map to a scalar: max (orig), topk (mean of "
+                        "top fraction), weighted_mean (rho-weighted average).")
+    p.add_argument("--topk-frac", type=float, default=0.001,
+                   help="Fraction of pixels for --p-agg topk (default 0.001 = 0.1%%).")
     # RAFT noise suppression — smooth, edge-free
     p.add_argument("--flow-spatial-sigma", type=float, default=0.0,
                    help="Gaussian sigma (in H/8-grid pixels) for spatial smooth on u "
