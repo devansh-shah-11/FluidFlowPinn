@@ -151,84 +151,110 @@ def main(args: argparse.Namespace) -> None:
     print(_stats(u_mag,  "|u|  "))
     print(_stats(var_u,  "Var(u)"))
 
+    tau = args.tau
+
+    # ── build head mask at flow grid resolution ───────────────────────────────
+    # rho is at lwcc native res; downsample to RAFT coarse grid (H/8, W/8)
+    Hf, Wf = u_np.shape[1], u_np.shape[2]
+    rho_at_flow = cv2.resize(rho_np, (Wf, Hf), interpolation=cv2.INTER_LINEAR)
+    head_mask = (rho_at_flow > tau).astype(np.float32)          # 1 inside head, 0 outside
+
+    # masked flow: zero out non-head pixels before computing variance
+    u_masked = u_np * head_mask[np.newaxis, :, :]               # (2, Hf, Wf)
+    var_u_masked = _local_var(u_masked)
+
+    # masked pressure = rho * masked_var  (rho also at flow grid)
+    P_unmasked = rho_at_flow * var_u
+    P_masked   = rho_at_flow * var_u_masked
+
+    print(_stats(var_u_masked, f"Var(u) τ={tau}"))
+    print(_stats(P_masked,     f"P masked τ={tau}"))
+
     # rho is at lwcc native res; flow is at H/8.  Report both.
     print(f"\nrho shape  : {rho_np.shape}  (lwcc native output res)")
     print(f"u shape    : {u_np.shape}    (RAFT H/8 grid)")
+    print(f"mask coverage: {100*head_mask.mean():.1f}% of flow-grid pixels above τ={tau}")
 
-    # ── figure ────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    # ── figure: 3 rows × 3 cols ───────────────────────────────────────────────
+    fig, axes = plt.subplots(3, 3, figsize=(20, 16))
     fig.suptitle(
-        f"Diagnostic  |  {args.lwcc_model}/{args.lwcc_weights}  |  "
+        f"Diagnostic  |  {args.lwcc_model}/{args.lwcc_weights}  τ={tau}  |  "
         f"frame: {Path(args.frame_t).name}\n"
         f"lwcc count={count:.1f}  rho max={rho_np.max():.4f}  "
-        f"|u| max={u_mag.max():.3f}  Var(u) max={var_u.max():.4f}",
+        f"|u| max={u_mag.max():.3f}  mask={100*head_mask.mean():.1f}% pixels",
         fontsize=11,
     )
 
     rgb_t = cv2.cvtColor(bgr_t, cv2.COLOR_BGR2RGB)
 
-    # Panel 1 — input
+    # Row 0 — input | density | histogram
     axes[0, 0].imshow(rgb_t)
     axes[0, 0].set_title(f"Input frame t  ({W}×{H})")
     axes[0, 0].axis("off")
 
-    # Panel 2 — raw density map (lwcc native res)
-    im2 = axes[0, 1].imshow(rho_np, cmap="hot", interpolation="nearest")
+    im01 = axes[0, 1].imshow(rho_np, cmap="hot", interpolation="nearest")
     axes[0, 1].set_title(
         f"Density ρ — lwcc {args.lwcc_model}  ({rho_np.shape[1]}×{rho_np.shape[0]})\n"
         f"count={count:.1f}  max={rho_np.max():.4f}  p99={np.percentile(rho_np, 99):.4f}"
     )
-    plt.colorbar(im2, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    plt.colorbar(im01, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
-    # Panel 3 — density histogram (log y) — KEY for picking tau
     flat_rho = rho_np.flatten()
     axes[0, 2].hist(flat_rho, bins=120, log=True, color="tomato", edgecolor="none")
-    for tau in (0.001, 0.005, 0.01, 0.05, 0.1, 0.2):
-        pct_above = 100.0 * (flat_rho > tau).mean()
-        axes[0, 2].axvline(tau, linestyle="--", linewidth=0.9,
-                           label=f"τ={tau}  ({pct_above:.1f}% pixels above)")
+    for t_line in (0.001, 0.005, 0.01, 0.05, 0.1, 0.2):
+        pct_above = 100.0 * (flat_rho > t_line).mean()
+        lw = 2.0 if t_line == tau else 0.9
+        axes[0, 2].axvline(t_line, linestyle="--", linewidth=lw,
+                           label=f"τ={t_line}  ({pct_above:.1f}%)")
     axes[0, 2].legend(fontsize=7)
     axes[0, 2].set_xlabel("ρ value")
     axes[0, 2].set_ylabel("pixel count (log)")
-    axes[0, 2].set_title("ρ histogram  ← pick τ here")
+    axes[0, 2].set_title(f"ρ histogram  (bold = selected τ={tau})")
 
-    # Panel 4 — flow magnitude
-    im4 = axes[1, 0].imshow(u_mag, cmap="cool", interpolation="nearest")
+    # Row 1 — flow magnitude | Var(u) unmasked | head mask
+    im10 = axes[1, 0].imshow(u_mag, cmap="cool", interpolation="nearest")
     axes[1, 0].set_title(
-        f"|u|  ({u_np.shape[2]}×{u_np.shape[1]})\n"
+        f"|u|  ({Wf}×{Hf})\n"
         f"max={u_mag.max():.3f}  mean={u_mag.mean():.3f} coarse-grid px/frame"
     )
-    plt.colorbar(im4, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    plt.colorbar(im10, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    # Panel 5 — unmasked Var(u) — the noisy baseline we want to fix
-    im5 = axes[1, 1].imshow(var_u, cmap="plasma", interpolation="nearest",
-                             vmin=0, vmax=np.percentile(var_u, 99) + 1e-9)
+    vmax_var = np.percentile(var_u, 99) + 1e-9
+    im11 = axes[1, 1].imshow(var_u, cmap="plasma", interpolation="nearest",
+                              vmin=0, vmax=vmax_var)
     axes[1, 1].set_title(
-        f"Var(u) unmasked  ({var_u.shape[1]}×{var_u.shape[0]})\n"
-        f"max={var_u.max():.4f}  p99={np.percentile(var_u, 99):.4f}"
+        f"Var(u) UNMASKED\nmax={var_u.max():.4f}  p99={np.percentile(var_u, 99):.4f}"
     )
-    plt.colorbar(im5, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    plt.colorbar(im11, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
-    # Panel 6 — mask preview: upsample rho to frame res and overlay tau contours
-    rho_up = cv2.resize(rho_np, (W, H), interpolation=cv2.INTER_LINEAR)
-    overlay = rgb_t.copy().astype(np.float32) / 255.0
-    tau_colors = {0.01: (1.0, 0.3, 0.3), 0.05: (0.3, 1.0, 0.3), 0.1: (0.3, 0.3, 1.0)}
-    legend_patches = []
-    for tau, color in tau_colors.items():
-        mask = (rho_up > tau).astype(np.float32)
-        for c, v in enumerate(color):
-            overlay[:, :, c] = np.where(mask > 0,
-                                         overlay[:, :, c] * 0.5 + v * 0.5,
-                                         overlay[:, :, c])
-        pct = 100.0 * mask.mean()
-        legend_patches.append(
-            plt.matplotlib.patches.Patch(
-                color=color, label=f"τ={tau}  {pct:.1f}% pixels")
-        )
-    axes[1, 2].imshow(np.clip(overlay, 0, 1))
-    axes[1, 2].legend(handles=legend_patches, fontsize=8, loc="lower right")
-    axes[1, 2].set_title("Head-mask preview (ρ > τ upsampled to frame res)")
-    axes[1, 2].axis("off")
+    im12 = axes[1, 2].imshow(head_mask, cmap="gray", interpolation="nearest", vmin=0, vmax=1)
+    axes[1, 2].set_title(
+        f"Head mask  (ρ > τ={tau} at flow grid)\n"
+        f"{100*head_mask.mean():.1f}% pixels active"
+    )
+    plt.colorbar(im12, ax=axes[1, 2], fraction=0.046, pad=0.04)
+
+    # Row 2 — Var(u) masked | P unmasked | P masked
+    im20 = axes[2, 0].imshow(var_u_masked, cmap="plasma", interpolation="nearest",
+                              vmin=0, vmax=vmax_var)
+    axes[2, 0].set_title(
+        f"Var(u) MASKED  τ={tau}\nmax={var_u_masked.max():.4f}  p99={np.percentile(var_u_masked, 99):.4f}"
+    )
+    plt.colorbar(im20, ax=axes[2, 0], fraction=0.046, pad=0.04)
+
+    im21 = axes[2, 1].imshow(P_unmasked, cmap="turbo", interpolation="nearest",
+                              vmin=0, vmax=np.percentile(P_unmasked, 99) + 1e-9)
+    axes[2, 1].set_title(
+        f"P = ρ · Var(u)  UNMASKED\nmax={P_unmasked.max():.4f}  p99={np.percentile(P_unmasked, 99):.4f}"
+    )
+    plt.colorbar(im21, ax=axes[2, 1], fraction=0.046, pad=0.04)
+
+    im22 = axes[2, 2].imshow(P_masked, cmap="turbo", interpolation="nearest",
+                              vmin=0, vmax=np.percentile(P_unmasked, 99) + 1e-9)
+    axes[2, 2].set_title(
+        f"P = ρ · Var(u)  MASKED  τ={tau}\nmax={P_masked.max():.4f}  p99={np.percentile(P_masked, 99):.4f}"
+    )
+    plt.colorbar(im22, ax=axes[2, 2], fraction=0.046, pad=0.04)
 
     plt.tight_layout()
     out_path = Path(args.out)
@@ -250,6 +276,8 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--lwcc-weights", default="SHA",
                    choices=("SHA", "SHB", "QNRF"),
                    help="lwcc pretrained weights dataset (default: SHA)")
+    p.add_argument("--tau", type=float, default=0.01,
+                   help="Density threshold for head mask (default: 0.01)")
     return p.parse_args()
 
 
