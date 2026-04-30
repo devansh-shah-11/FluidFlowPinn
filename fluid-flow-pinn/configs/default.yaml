@@ -25,6 +25,17 @@ model:
   use_fp16: true
   grad_checkpoint: true         # gradient checkpointing on shared backbone
 
+  # Flow branch backend: "alltracker" (default — multi-frame point tracker,
+  # better on dense crowds) or "raft" (torchvision RAFT-Small, pairwise).
+  flow_backend: alltracker
+  alltracker:
+    repo_path: null             # path to local clone of github.com/aharley/alltracker
+                                # (null → must already be on PYTHONPATH)
+    weights: null               # local .pth; null → download from HuggingFace
+    window_len: 16              # rolling temporal window
+    iters: 4                    # refinement iters per forward
+    tiny: false                 # use alltracker_tiny.pth (smaller/faster)
+
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   epochs: 100

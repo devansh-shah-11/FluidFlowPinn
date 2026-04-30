@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.branch1_density import CSRNet, load_csrnet
-from models.branch2_flow import RAFTFlow, load_raft
+from models.branch2_flow import RAFTFlow, load_raft, load_flow_branch
 from models.branch3_pressure import PressureMap
 
 
@@ -39,6 +39,11 @@ class FluidFlowPINN(nn.Module):
         csrnet_weights: Optional[str | Path] = None,
         raft_weights: Optional[str | Path] = None,
         freeze_density: bool = False,
+        flow_backend: str = "raft",
+        alltracker_repo: Optional[str | Path] = None,
+        alltracker_window_len: int = 16,
+        alltracker_iters: int = 4,
+        alltracker_tiny: bool = False,
     ) -> None:
         super().__init__()
 
@@ -49,9 +54,15 @@ class FluidFlowPINN(nn.Module):
             freeze=freeze_density,
         )
 
-        self.flow_branch = load_raft(
+        self.flow_backend = flow_backend
+        self.flow_branch = load_flow_branch(
+            backend=flow_backend,
             weights_path=raft_weights,
             frozen=raft_frozen,
+            repo_path=alltracker_repo,
+            window_len=alltracker_window_len,
+            inference_iters=alltracker_iters,
+            tiny=alltracker_tiny,
         )
 
         self.pressure_branch = PressureMap(window_size=pressure_window)

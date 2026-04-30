@@ -289,6 +289,11 @@ def train(cfg: dict, args: argparse.Namespace) -> None:
         csrnet_weights=_cfg(cfg, "model", "csrnet_weights"),
         raft_weights=_cfg(cfg, "model", "raft_weights"),
         freeze_density=_cfg(cfg, "model", "freeze_density", default=False),
+        flow_backend=_cfg(cfg, "model", "flow_backend", default="raft"),
+        alltracker_repo=_cfg(cfg, "model", "alltracker", "repo_path", default=None),
+        alltracker_window_len=_cfg(cfg, "model", "alltracker", "window_len", default=16),
+        alltracker_iters=_cfg(cfg, "model", "alltracker", "iters", default=4),
+        alltracker_tiny=_cfg(cfg, "model", "alltracker", "tiny", default=False),
     ).to(device)
 
     # ── Loss ──────────────────────────────────────────────────────────────────

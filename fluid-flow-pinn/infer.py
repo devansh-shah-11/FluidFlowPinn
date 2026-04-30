@@ -126,6 +126,11 @@ def _load_model(
     checkpoint_path: Optional[Path],
     csrnet_weights: Optional[Path],
     device: torch.device,
+    flow_backend: str = "raft",
+    alltracker_repo: Optional[str] = None,
+    alltracker_window_len: int = 16,
+    alltracker_iters: int = 4,
+    alltracker_tiny: bool = False,
 ) -> tuple:
     """Load the PINN. Two modes:
 
@@ -150,8 +155,13 @@ def _load_model(
             use_grad_checkpoint=False,
             raft_frozen=True,
             pressure_window=cfg.get("model", {}).get("pressure_window", 5),
+            flow_backend=flow_backend,
+            alltracker_repo=alltracker_repo,
+            alltracker_window_len=alltracker_window_len,
+            alltracker_iters=alltracker_iters,
+            alltracker_tiny=alltracker_tiny,
         ).to(device)
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"], strict=(flow_backend == "raft"))
         model.eval()
         log.info("Model loaded (epoch %s, val_loss=%.4f) | device=%s fp16=%s",
                  ckpt.get("epoch", "?"), ckpt.get("val_loss", float("nan")),
@@ -169,6 +179,11 @@ def _load_model(
         pressure_window=5,
         csrnet_weights=str(csrnet_weights),
         freeze_density=True,
+        flow_backend=flow_backend,
+        alltracker_repo=alltracker_repo,
+        alltracker_window_len=alltracker_window_len,
+        alltracker_iters=alltracker_iters,
+        alltracker_tiny=alltracker_tiny,
     ).to(device)
     model.eval()
     log.info("Model ready (CSRNet frozen, RAFT frozen) | device=%s fp16=%s",
@@ -548,7 +563,19 @@ def run(args: argparse.Namespace) -> None:
     if (ckpt is None) == (csrw is None):
         log.error("Specify exactly one of --checkpoint or --csrnet-weights")
         sys.exit(2)
-    model, cfg, use_fp16 = _load_model(ckpt, csrw, device)
+    model, cfg, use_fp16 = _load_model(
+        ckpt, csrw, device,
+        flow_backend=args.flow_backend,
+        alltracker_repo=args.alltracker_repo,
+        alltracker_window_len=args.alltracker_window,
+        alltracker_iters=args.alltracker_iters,
+        alltracker_tiny=args.alltracker_tiny,
+    )
+
+    # Streaming AllTracker keeps a per-clip rolling buffer; reset before
+    # processing a new source so we don't carry frames across runs.
+    if args.flow_backend == "alltracker" and hasattr(model.flow_branch, "reset"):
+        model.flow_branch.reset()
 
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
@@ -630,10 +657,22 @@ def run(args: argparse.Namespace) -> None:
             u_np:   Optional[np.ndarray] = None
             P_np:   Optional[np.ndarray] = None
             p_max:  Optional[float] = None
+            in_warmup = False
 
             if prev_tensor is not None:
                 with autocast(device_type=device.type, enabled=use_fp16):
                     out = model(prev_tensor, cur_tensor)
+
+                # AllTracker quality is poor until the rolling buffer fills.
+                # Optionally suppress P (and skip pushing to history) during
+                # this warmup so the timeline isn't dominated by garbage.
+                in_warmup = False
+                if args.flow_backend == "alltracker":
+                    fb = model.flow_branch
+                    buf_len = len(getattr(fb, "_buf", []))
+                    win = getattr(fb, "window_len", 16)
+                    if buf_len < win:
+                        in_warmup = True
                 rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
                 u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
 
@@ -671,8 +710,9 @@ def run(args: argparse.Namespace) -> None:
                 p_max = _aggregate_pressure(
                     P_np, rho_np, mode=args.p_agg, topk_frac=args.topk_frac,
                 )
-                history.append(p_max)
-                all_scores.append(p_max)
+                if not (in_warmup and args.alltracker_suppress_warmup):
+                    history.append(p_max)
+                    all_scores.append(p_max)
             # On the first frame we have no pair yet — render the dashboard
             # using the current frame and skip ρ/P.
 
@@ -687,6 +727,11 @@ def run(args: argparse.Namespace) -> None:
                 display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max, p_formula=p_formula,
             )
+            if in_warmup:
+                cv2.putText(dash, "AllTracker WARMUP",
+                            (16, dash.shape[0] - 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 200, 255), 2, cv2.LINE_AA)
 
             if out_dir and writer is None:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -788,6 +833,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--flow-ema-alpha",     type=float, default=1.0,
                    help="Temporal EMA on u: u_t = alpha*u + (1-alpha)*u_{t-1}. "
                         "1.0 disables. Try 0.4 .. 0.6.")
+    # Flow backend selection
+    p.add_argument("--flow-backend", choices=("raft", "alltracker"),
+                   default="alltracker",
+                   help="Optical-flow backend. 'raft' (torchvision RAFT-Small, "
+                        "pairwise) or 'alltracker' (multi-frame point tracker, "
+                        "stronger on dense crowds).")
+    p.add_argument("--alltracker-repo", type=str, default=None,
+                   help="Path to a local clone of github.com/aharley/alltracker "
+                        "(only needed if the repo isn't already on PYTHONPATH).")
+    p.add_argument("--alltracker-window", type=int, default=16,
+                   help="AllTracker temporal window length (default 16).")
+    p.add_argument("--alltracker-iters",  type=int, default=4,
+                   help="AllTracker refinement iterations per forward (default 4).")
+    p.add_argument("--alltracker-tiny",   action="store_true",
+                   help="Use the lightweight alltracker_tiny.pth checkpoint.")
+    p.add_argument("--alltracker-suppress-warmup", action="store_true",
+                   help="Skip pushing P to history/timeline until the AllTracker "
+                        "rolling buffer is full (~window frames). Recommended.")
     return p.parse_args()
 
 

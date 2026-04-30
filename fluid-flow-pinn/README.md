@@ -116,3 +116,53 @@ data/
 - GPU: Tesla T4 (16 GB VRAM) via Google Colab
 - Python 3.10, CUDA 11.8, PyTorch 2.1
 - FP16 mixed precision + gradient checkpointing throughout
+
+---
+
+## Flow backend: AllTracker (default) vs RAFT
+
+Branch 2 supports two interchangeable optical-flow backends, selectable via
+`model.flow_backend` in `configs/default.yaml` or `--flow-backend` on the CLI.
+
+- **`alltracker` (default)** — multi-frame point tracker (Harley et al. 2025,
+  arXiv:2506.07310). Maintains a rolling 16-frame buffer and returns the
+  pairwise displacement of the last two frames, derived from anchor-based
+  trajectories. Much more robust on dense crowds with small (10–30 px) heads.
+- **`raft`** — torchvision RAFT-Small. Faster, pairwise; left in for
+  comparison/ablation.
+
+### One-time AllTracker setup
+
+```bash
+# 1. Clone the upstream repo somewhere on disk
+git clone https://github.com/aharley/alltracker.git ~/code/alltracker
+
+# 2a. Either point the project at it via config:
+#     model.alltracker.repo_path: /home/<you>/code/alltracker
+#
+# 2b. ...or export it on PYTHONPATH:
+export PYTHONPATH="$HOME/code/alltracker:$PYTHONPATH"
+
+# 3. (Optional) pre-download the weights — otherwise they download on first run
+#    to ~/.cache/torch/hub/checkpoints/
+#    Full:   https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth
+#    Tiny:   https://huggingface.co/aharley/alltracker/resolve/main/alltracker_tiny.pth
+```
+
+### Streaming behaviour
+
+AllTracker is multi-frame, so the first ~16 frames of any new stream are a
+**warmup** window. During warmup the dashboard shows an `AllTracker WARMUP`
+badge; pass `--alltracker-suppress-warmup` to keep those frames out of the
+P(t) timeline.
+
+### Inference example
+
+```bash
+python infer.py \
+  --csrnet-weights /path/PartAmodel_best.pth \
+  --source clip.mp4 --out-dir outputs/at_run/ \
+  --flow-backend alltracker \
+  --alltracker-repo $HOME/code/alltracker \
+  --alltracker-suppress-warmup
+```
