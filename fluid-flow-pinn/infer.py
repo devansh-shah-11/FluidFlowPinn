@@ -287,53 +287,6 @@ def _denoise_flow(
     return out
 
 
-def _multiscale_density(
-    model,
-    frame_bgr: np.ndarray,
-    device: torch.device,
-    use_fp16: bool,
-    scales: tuple,
-    target_hw: tuple,
-) -> np.ndarray:
-    """Test-time multi-scale CSRNet, fused per-pixel by max.
-
-    CSRNet's effective receptive field is fixed; in scenes with strong
-    perspective, far heads are too small and near heads are too big for the
-    single training scale. Running at multiple input scales catches heads of
-    different apparent sizes; per-pixel max keeps whichever scale lit up.
-
-    Args:
-        model: FluidFlowPINN (uses model.density_branch).
-        frame_bgr: original BGR frame at inference resolution (Hi, Wi, 3).
-        scales: tuple of float scale factors, e.g. (0.5, 1.0, 2.0).
-        target_hw: (H_out, W_out) — the H/8, W/8 grid where rho lives.
-
-    Returns:
-        rho_np: (H_out, W_out) fused density on the H/8 grid.
-    """
-    Hi, Wi = frame_bgr.shape[:2]
-    H_out, W_out = target_hw
-    fused = np.zeros((H_out, W_out), dtype=np.float32)
-
-    for s in scales:
-        # Snap scaled dims to multiples of 8 so /8 alignment holds.
-        h_s = max(8, ((int(round(Hi * s))) // 8) * 8)
-        w_s = max(8, ((int(round(Wi * s))) // 8) * 8)
-        f_s = cv2.resize(frame_bgr, (w_s, h_s), interpolation=cv2.INTER_LINEAR)
-        t = _bgr_to_tensor(f_s, device)
-        with autocast(device_type=device.type, enabled=use_fp16):
-            rho = model.density_branch(t)
-        rho_np = rho.squeeze().detach().float().cpu().numpy()
-        # Counts must be preserved when resizing a density map: scale by
-        # area ratio so that sum(rho) is invariant to resampling.
-        src_h, src_w = rho_np.shape
-        if (src_h, src_w) != (H_out, W_out):
-            area_ratio = (H_out * W_out) / float(src_h * src_w)
-            rho_np = cv2.resize(rho_np, (W_out, H_out), interpolation=cv2.INTER_LINEAR)
-            rho_np = rho_np * area_ratio
-        fused = np.maximum(fused, rho_np)
-    return fused
-
 
 def _aggregate_pressure(
     P_np: np.ndarray,
