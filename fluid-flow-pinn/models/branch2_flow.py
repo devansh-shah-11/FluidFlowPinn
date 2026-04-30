@@ -258,11 +258,15 @@ class AllTrackerFlow(nn.Module):
         )
         # full_flows is on cpu in the multi-frame branch; move back if needed.
         full_flows = full_flows.to(frame_t1.device)
-        # Crop padding
-        full_flows = full_flows[:, :, :, :H, :W]  # (1, T, 2, H, W)
-
-        # Pairwise = anchor[T-1] - anchor[T-2]
-        flow_pair = full_flows[:, -1] - full_flows[:, -2]  # (1, 2, H, W)
+        # forward_sliding has two return shapes:
+        #   T == 2: (B, 2, H, W) — already the pairwise flow frame0→frame1.
+        #   T  > 2: (B, T, 2, H, W) — anchor flows frame0→frame_t for t=0..T-1;
+        #                              pairwise = anchor[T-1] - anchor[T-2].
+        if full_flows.dim() == 4:
+            flow_pair = full_flows[:, :, :H, :W]  # (1, 2, H, W)
+        else:
+            full_flows = full_flows[:, :, :, :H, :W]  # (1, T, 2, H, W)
+            flow_pair = full_flows[:, -1] - full_flows[:, -2]  # (1, 2, H, W)
 
         # Downsample to H/8 grid (area-avg keeps magnitude correct for a
         # uniform field; same as torchvision interpolate bilinear, then /8 for
