@@ -11,21 +11,19 @@ Modes:
   • Single image: --source path/to/img.jpg   (only ρ is shown; P needs two frames)
 
 Examples:
-    # No-training mode: pretrained ShanghaiTech CSRNet + torchvision RAFT
-    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
-        --source clip.mp4 --out-dir outputs/infer_run/
+    # Default: lwcc DM-Count density + torchvision RAFT, head-mask-gated variance
+    python infer.py --source clip.mp4 --out-dir outputs/infer_run/ \\
+        --density-mask-tau 0.01
 
-    # Same, with live window
-    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
-        --source clip.mp4 --out-dir outputs/infer_run/ --display
+    # Live window
+    python infer.py --source clip.mp4 --display --density-mask-tau 0.01
 
     # Webcam
-    python infer.py --csrnet-weights /path/PartAmodel_best.pth \\
-        --source 0 --display
+    python infer.py --source 0 --display --density-mask-tau 0.01
 
-    # Or, after a training run, use a full checkpoint instead
+    # After a training run, use a full checkpoint instead
     python infer.py --checkpoint checkpoints/best.pt --source clip.mp4 \\
-        --out-dir outputs/infer_run/
+        --out-dir outputs/infer_run/ --density-mask-tau 0.01
 """
 
 from __future__ import annotations
@@ -43,6 +41,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import tempfile
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast
@@ -124,56 +123,46 @@ class _Source:
 
 def _load_model(
     checkpoint_path: Optional[Path],
-    csrnet_weights: Optional[Path],
     device: torch.device,
 ) -> tuple:
-    """Load the PINN. Two modes:
+    """Load RAFT flow branch only — density is handled by lwcc externally.
 
-      • `checkpoint_path` given: load a full training checkpoint (best.pt).
-      • `csrnet_weights` given: build the PINN with ShanghaiTech CSRNet
-        weights for the density branch and torchvision-pretrained RAFT
-        for the flow branch. Both branches are frozen — no training
-        was needed because PressureMap has no learnable params.
+      • `checkpoint_path` given: extract RAFT weights from a full training
+        checkpoint (best.pt) so we don't waste time loading CSRNet.
+      • None: load torchvision-pretrained RAFT directly.
+
+    Returns (flow_branch, cfg, use_fp16) — flow_branch is a RAFTFlow module.
     """
     repo_root = Path(__file__).parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from models.pinn import FluidFlowPINN
+    from models.branch2_flow import load_raft
+
+    use_fp16 = device.type == "cuda"
 
     if checkpoint_path is not None:
-        log.info("Loading training checkpoint: %s", checkpoint_path)
+        log.info("Loading RAFT from training checkpoint: %s", checkpoint_path)
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         cfg  = ckpt.get("config", {}) or {}
         use_fp16 = cfg.get("model", {}).get("use_fp16", True) and device.type == "cuda"
-        model = FluidFlowPINN(
-            use_grad_checkpoint=False,
-            raft_frozen=True,
-            pressure_window=cfg.get("model", {}).get("pressure_window", 5),
-        ).to(device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
-        log.info("Model loaded (epoch %s, val_loss=%.4f) | device=%s fp16=%s",
-                 ckpt.get("epoch", "?"), ckpt.get("val_loss", float("nan")),
-                 device, use_fp16)
-        return model, cfg, use_fp16
+        # Extract only the flow_branch sub-state so we skip loading CSRNet weights.
+        full_sd = ckpt["model"]
+        flow_sd = {k[len("flow_branch."):]: v
+                   for k, v in full_sd.items() if k.startswith("flow_branch.")}
+        flow_branch = load_raft(frozen=True).to(device)
+        flow_branch.load_state_dict(flow_sd)
+        flow_branch.eval()
+        log.info("RAFT loaded from checkpoint (epoch %s) | device=%s fp16=%s",
+                 ckpt.get("epoch", "?"), device, use_fp16)
+        return flow_branch, cfg, use_fp16
 
-    assert csrnet_weights is not None, "Need either --checkpoint or --csrnet-weights"
-    log.info("Building inference-only PINN | CSRNet=%s  RAFT=torchvision-pretrained",
-             csrnet_weights)
     cfg = {}
-    use_fp16 = device.type == "cuda"
-    model = FluidFlowPINN(
-        use_grad_checkpoint=False,
-        raft_frozen=True,
-        pressure_window=5,
-        csrnet_weights=str(csrnet_weights),
-        freeze_density=True,
-    ).to(device)
-    model.eval()
-    log.info("Model ready (CSRNet frozen, RAFT frozen) | device=%s fp16=%s",
-             device, use_fp16)
-    return model, cfg, use_fp16
+    log.info("Loading torchvision-pretrained RAFT | device=%s fp16=%s", device, use_fp16)
+    flow_branch = load_raft(frozen=True).to(device)
+    flow_branch.eval()
+    log.info("RAFT ready.")
+    return flow_branch, cfg, use_fp16
 
 
 def _bgr_to_tensor(frame_bgr: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -231,6 +220,52 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     Ex2_y = cv2.blur(uy * uy, kernel)
     var = ((Ex2_x - Ex_x ** 2) + (Ex2_y - Ex_y ** 2)) / 2.0
     return np.clip(var, 0.0, None)
+
+
+def _load_lwcc(model_name: str, model_weights: str):
+    """Load lwcc crowd-counting model once; returns (model, get_count_fn)."""
+    try:
+        from lwcc.LWCC import load_model, get_count
+    except ImportError:
+        log.error("lwcc not installed. Run: pip install lwcc")
+        sys.exit(1)
+    log.info("Loading lwcc %s/%s …", model_name, model_weights)
+    m = load_model(model_name=model_name, model_weights=model_weights)
+    log.info("lwcc ready.")
+    return m, get_count
+
+
+def _lwcc_density_np(
+    bgr: np.ndarray,
+    lwcc_model,
+    lwcc_get_count,
+    model_name: str,
+    target_hw: tuple[int, int],
+) -> np.ndarray:
+    """Run lwcc on a BGR frame and return density map resized to target_hw (H, W)."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = f.name
+    try:
+        cv2.imwrite(tmp, bgr)
+        _, density = lwcc_get_count(
+            tmp,
+            model_name=model_name,
+            model=lwcc_model,
+            return_density=True,
+            resize_img=False,
+        )
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    rho = np.array(density, dtype=np.float32)
+    H, W = target_hw
+    if rho.shape != (H, W):
+        rho = cv2.resize(rho, (W, H), interpolation=cv2.INTER_LINEAR)
+    return rho
+
+
+def _head_mask(rho_np: np.ndarray, tau: float) -> np.ndarray:
+    """Binary mask (float32, 0/1) where density exceeds tau."""
+    return (rho_np > tau).astype(np.float32)
 
 
 def _denoise_flow(
@@ -356,8 +391,13 @@ def _compute_pressure_np(
     rho_alpha: float,
     per_capita: bool,
     per_capita_eps: float,
+    mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Recompute P from ρ and (denoised) u with configurable coupling.
+
+    mask: optional float32 (H', W') binary array from _head_mask(). When given,
+          flow vectors outside the mask are zeroed before Var(u) is computed so
+          that clothing/background motion doesn't pollute the variance.
 
     Coupling modes:
       • per_capita=True : P = Var(u) / (rho + eps)  — flags per-capita turbulence
@@ -365,6 +405,12 @@ def _compute_pressure_np(
         - rho_alpha=1 reproduces the original P = rho * Var(u)
         - rho_alpha=0 gives P = Var(u) (decoupled from density)
     """
+    if mask is not None:
+        # resize mask to flow grid if needed, then gate flow
+        mh, mw = u_np.shape[1], u_np.shape[2]
+        m = mask if mask.shape == (mh, mw) else cv2.resize(mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
+        u_np = u_np * m[np.newaxis, :, :]
+
     var_u = _local_var_np(u_np, k=window)  # (Hf, Wf)
     h, w = rho_np.shape[-2:]
     if var_u.shape != (h, w):
@@ -544,11 +590,10 @@ def _build_dashboard(
 def run(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = Path(args.checkpoint) if args.checkpoint else None
-    csrw = Path(args.csrnet_weights) if args.csrnet_weights else None
-    if (ckpt is None) == (csrw is None):
-        log.error("Specify exactly one of --checkpoint or --csrnet-weights")
-        sys.exit(2)
-    model, cfg, use_fp16 = _load_model(ckpt, csrw, device)
+    model, cfg, use_fp16 = _load_model(ckpt, device)
+
+    # lwcc is the density source — load once, reuse every frame
+    lwcc_model, lwcc_get_count = _load_lwcc(args.lwcc_model, args.lwcc_weights)
 
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
@@ -559,25 +604,15 @@ def run(args: argparse.Namespace) -> None:
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    ms_scales = None
-    if args.density_scales:
-        try:
-            ms_scales = tuple(float(s) for s in args.density_scales.split(","))
-        except ValueError:
-            log.error("--density-scales must be a comma list of floats, got %r",
-                      args.density_scales)
-            sys.exit(2)
-        log.info("Multi-scale CSRNet enabled: scales=%s (fused per-pixel by max)",
-                 ms_scales)
-
     if args.per_capita:
-        p_formula = "Var(u) / (rho+eps)"
+        p_formula = "Var(u[mask]) / (rho+eps)" if args.density_mask_tau > 0 else "Var(u) / (rho+eps)"
     elif args.rho_alpha == 1.0:
-        p_formula = "rho * Var(u)"
+        p_formula = "rho * Var(u[mask])" if args.density_mask_tau > 0 else "rho * Var(u)"
     elif args.rho_alpha == 0.0:
-        p_formula = "Var(u)"
+        p_formula = "Var(u[mask])" if args.density_mask_tau > 0 else "Var(u)"
     else:
-        p_formula = f"rho^{args.rho_alpha:g} * Var(u)"
+        suffix = "[mask]" if args.density_mask_tau > 0 else ""
+        p_formula = f"rho^{args.rho_alpha:g} * Var(u{suffix})"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
     history: deque[float] = deque(maxlen=history_len)
@@ -593,10 +628,10 @@ def run(args: argparse.Namespace) -> None:
         frame = src.read()
         assert frame is not None
         frame_resized = cv2.resize(frame, (inf_w, inf_h))
-        ft = _bgr_to_tensor(frame_resized, device)
-        with autocast(device_type=device.type, enabled=use_fp16):
-            rho = model.density_branch(ft)
-        rho_np = rho.squeeze().detach().float().cpu().numpy()
+        rho_np = _lwcc_density_np(
+            frame_resized, lwcc_model, lwcc_get_count,
+            args.lwcc_model, target_hw=(inf_h // 8, inf_w // 8),
+        )
         dash = _build_dashboard(frame_resized, rho_np, None, None,
                                 history, threshold, 0.0, 0, None)
         if out_dir:
@@ -633,18 +668,16 @@ def run(args: argparse.Namespace) -> None:
 
             if prev_tensor is not None:
                 with autocast(device_type=device.type, enabled=use_fp16):
-                    out = model(prev_tensor, cur_tensor)
-                rho_np = out["rho"].squeeze().detach().float().cpu().numpy()
-                u_np   = out["u"].squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
+                    u_t = model(prev_tensor, cur_tensor)
+                u_np = u_t.squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
 
-                # Test-time multi-scale CSRNet, fused per-pixel by max.
-                # Catches near-heads (downscale pass) and far-heads (upscale
-                # pass) that the single training scale misses.
-                if ms_scales is not None:
-                    rho_np = _multiscale_density(
-                        model, frame_resized, device, use_fp16,
-                        scales=ms_scales, target_hw=rho_np.shape,
-                    )
+                # lwcc density — primary source for rho and head mask
+                rho_np = _lwcc_density_np(
+                    frame_resized, lwcc_model, lwcc_get_count,
+                    args.lwcc_model, target_hw=(u_np.shape[1], u_np.shape[2]),
+                )
+                head_mask = _head_mask(rho_np, args.density_mask_tau) \
+                    if args.density_mask_tau > 0.0 else None
 
                 # Smooth u to suppress RAFT noise without introducing edges.
                 # Spatial Gaussian first, then temporal EMA across frames.
@@ -652,21 +685,14 @@ def run(args: argparse.Namespace) -> None:
                 u_np = _temporal_ema(u_ema, u_np, alpha=args.flow_ema_alpha)
                 u_ema = u_np  # carry forward for next frame
 
-                # Decouple ρ from Var(u) in the danger score. When the user
-                # passes a non-default coupling, recompute P here instead of
-                # using model output (which is fixed at P = ρ · Var(u)).
-                use_custom_P = args.per_capita or args.rho_alpha != 1.0 \
-                    or args.flow_spatial_sigma > 0.0 or args.flow_ema_alpha < 1.0
-                if use_custom_P:
-                    P_np = _compute_pressure_np(
-                        rho_np, u_np,
-                        window=cfg.get("model", {}).get("pressure_window", 5),
-                        rho_alpha=args.rho_alpha,
-                        per_capita=args.per_capita,
-                        per_capita_eps=args.per_capita_eps,
-                    )
-                else:
-                    P_np = out["P"].squeeze().detach().float().cpu().numpy()
+                P_np = _compute_pressure_np(
+                    rho_np, u_np,
+                    window=cfg.get("model", {}).get("pressure_window", 5),
+                    rho_alpha=args.rho_alpha,
+                    per_capita=args.per_capita,
+                    per_capita_eps=args.per_capita_eps,
+                    mask=head_mask,
+                )
 
                 p_max = _aggregate_pressure(
                     P_np, rho_np, mode=args.p_agg, topk_frac=args.topk_frac,
@@ -744,11 +770,9 @@ def run(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Realtime PINN inference dashboard")
-    p.add_argument("--checkpoint",      default=None,
-                   help="Path to a full training checkpoint .pt (best.pt)")
-    p.add_argument("--csrnet-weights",  default=None,
-                   help="Path to a ShanghaiTech CSRNet .pth — runs inference with "
-                        "pretrained CSRNet + torchvision-pretrained RAFT, no training")
+    p.add_argument("--checkpoint", default=None,
+                   help="Path to a full training checkpoint .pt (best.pt). "
+                        "Omit to run with torchvision-pretrained RAFT + lwcc density.")
     p.add_argument("--source",     required=True,
                    help="Video file path, image path, or webcam index (e.g. 0)")
     p.add_argument("--out-dir",    default=None,
@@ -770,10 +794,6 @@ def _parse_args() -> argparse.Namespace:
                         "Overrides --rho-alpha.")
     p.add_argument("--per-capita-eps", type=float, default=1e-3,
                    help="Epsilon in per-capita denominator (default 1e-3).")
-    # Multi-scale CSRNet — fix far/near head undercounting
-    p.add_argument("--density-scales", type=str, default=None,
-                   help="Comma list of input scales for multi-scale CSRNet, e.g. "
-                        "'0.5,1.0,2.0'. Fused per-pixel by max. Default: off.")
     # Aggregator — how to reduce P-map to a scalar danger score
     p.add_argument("--p-agg", choices=("max", "topk", "weighted_mean"),
                    default="max",
@@ -788,6 +808,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--flow-ema-alpha",     type=float, default=1.0,
                    help="Temporal EMA on u: u_t = alpha*u + (1-alpha)*u_{t-1}. "
                         "1.0 disables. Try 0.4 .. 0.6.")
+    # Head-mask-gated variance via lwcc density
+    p.add_argument("--density-mask-tau", type=float, default=0.0,
+                   help="Density threshold τ for head mask. Var(u) is computed only "
+                        "where lwcc density > τ. 0 disables (default). Try 0.01.")
+    p.add_argument("--lwcc-model",   default="DM-Count",
+                   choices=("CSRNet", "SFANet", "Bay", "DM-Count"),
+                   help="lwcc model for head masking (default: DM-Count).")
+    p.add_argument("--lwcc-weights", default="SHA",
+                   choices=("SHA", "SHB", "QNRF"),
+                   help="lwcc pretrained weights (default: SHA).")
     return p.parse_args()
 
 
