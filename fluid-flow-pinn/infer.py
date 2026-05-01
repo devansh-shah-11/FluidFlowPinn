@@ -295,25 +295,30 @@ def _yolo_person_mask(
     yolo_model,
     target_hw: tuple[int, int],
     conf: float = 0.25,
-) -> np.ndarray:
-    """Run YOLO on a BGR frame, return a float32 (0/1) mask of person bounding boxes
-    resized to target_hw (H, W)."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run YOLO on a BGR frame.
+
+    Returns:
+        mask: float32 (0/1) mask of person bounding boxes resized to target_hw (H, W)
+        boxes_xyxy: (N, 4) array of person boxes in source-frame pixel coordinates
+    """
     H_src, W_src = bgr.shape[:2]
     H_out, W_out = target_hw
     results = yolo_model(bgr, verbose=False)
     boxes = results[0].boxes
-    person_xyxy = boxes.xyxy[(boxes.cls == 0) & (boxes.conf > conf)]
+    keep = (boxes.cls == 0) & (boxes.conf > conf)
+    person_xyxy = boxes.xyxy[keep].cpu().numpy()  # (N, 4) in source coords
 
     mask = np.zeros((H_out, W_out), dtype=np.float32)
     sx = W_out / W_src
     sy = H_out / H_src
-    for box in person_xyxy.cpu().numpy():
+    for box in person_xyxy:
         x1 = max(0, int(box[0] * sx))
         y1 = max(0, int(box[1] * sy))
         x2 = min(W_out, int(box[2] * sx))
         y2 = min(H_out, int(box[3] * sy))
         mask[y1:y2, x1:x2] = 1.0
-    return mask
+    return mask, person_xyxy
 
 
 def _denoise_flow(
@@ -499,6 +504,7 @@ def _build_dashboard(
     pressure_window: int = 5,
     p_formula: str = "rho * Var(u)",
     head_mask: Optional[np.ndarray] = None,
+    yolo_boxes: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
@@ -523,6 +529,16 @@ def _build_dashboard(
 
     # Row 1 — input + ρ
     input_pane = fr.copy()
+    if yolo_boxes is not None and len(yolo_boxes) > 0:
+        H_src, W_src = frame_bgr.shape[:2]
+        sx = pane_w / W_src
+        sy = pane_h / H_src
+        for box in yolo_boxes:
+            bx1 = max(0, int(box[0] * sx))
+            by1 = max(0, int(box[1] * sy))
+            bx2 = min(pane_w - 1, int(box[2] * sx))
+            by2 = min(pane_h - 1, int(box[3] * sy))
+            cv2.rectangle(input_pane, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
     _label(input_pane, "input")
 
     if rho_np is not None:
@@ -685,6 +701,7 @@ def run(args: argparse.Namespace) -> None:
             P_np:      Optional[np.ndarray] = None
             p_max:     Optional[float] = None
             head_mask: Optional[np.ndarray] = None
+            yolo_boxes: Optional[np.ndarray] = None
 
             if prev_tensor is not None:
                 with autocast(device_type=device.type, enabled=use_fp16):
@@ -698,7 +715,7 @@ def run(args: argparse.Namespace) -> None:
                     tmp_path=lwcc_tmp,
                 )
                 if yolo_model is not None:
-                    head_mask = _yolo_person_mask(
+                    head_mask, yolo_boxes = _yolo_person_mask(
                         frame_resized, yolo_model,
                         target_hw=(u_np.shape[1], u_np.shape[2]),
                         conf=args.detector_conf,
@@ -741,7 +758,7 @@ def run(args: argparse.Namespace) -> None:
             dash = _build_dashboard(
                 display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max, p_formula=p_formula,
-                head_mask=head_mask,
+                head_mask=head_mask, yolo_boxes=yolo_boxes,
             )
 
             if out_dir and writer is None:
