@@ -276,6 +276,46 @@ def _head_mask(rho_np: np.ndarray, tau: float) -> np.ndarray:
     return (rho_np > tau).astype(np.float32)
 
 
+def _load_yolo(model_name: str, device: torch.device):
+    """Load an ultralytics YOLO model for person detection."""
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        log.error("ultralytics not installed. Run: pip install ultralytics")
+        sys.exit(1)
+    log.info("Loading YOLO detector: %s …", model_name)
+    m = YOLO(model_name)
+    m.to(device)
+    log.info("YOLO ready on %s.", device)
+    return m
+
+
+def _yolo_person_mask(
+    bgr: np.ndarray,
+    yolo_model,
+    target_hw: tuple[int, int],
+    conf: float = 0.25,
+) -> np.ndarray:
+    """Run YOLO on a BGR frame, return a float32 (0/1) mask of person bounding boxes
+    resized to target_hw (H, W)."""
+    H_src, W_src = bgr.shape[:2]
+    H_out, W_out = target_hw
+    results = yolo_model(bgr, verbose=False)
+    boxes = results[0].boxes
+    person_xyxy = boxes.xyxy[(boxes.cls == 0) & (boxes.conf > conf)]
+
+    mask = np.zeros((H_out, W_out), dtype=np.float32)
+    sx = W_out / W_src
+    sy = H_out / H_src
+    for box in person_xyxy.cpu().numpy():
+        x1 = max(0, int(box[0] * sx))
+        y1 = max(0, int(box[1] * sy))
+        x2 = min(W_out, int(box[2] * sx))
+        y2 = min(H_out, int(box[3] * sy))
+        mask[y1:y2, x1:x2] = 1.0
+    return mask
+
+
 def _denoise_flow(
     u_np: np.ndarray,
     spatial_sigma: float,
@@ -458,7 +498,7 @@ def _build_dashboard(
     p_max: Optional[float],
     pressure_window: int = 5,
     p_formula: str = "rho * Var(u)",
-    density_mask_tau: float = 0.0,
+    head_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
@@ -496,12 +536,13 @@ def _build_dashboard(
     # Row 2 — |u| (with arrows) + Var(u)
     if u_np is not None:
         # Apply head mask to visualization so arrows/heatmap only show where people are.
-        u_vis = u_np
-        if density_mask_tau > 0.0 and rho_np is not None:
+        if head_mask is not None:
             mh, mw = u_np.shape[1], u_np.shape[2]
-            mask = rho_np if rho_np.shape == (mh, mw) else cv2.resize(
-                rho_np, (mw, mh), interpolation=cv2.INTER_NEAREST)
-            u_vis = u_np * (mask > density_mask_tau).astype(np.float32)[np.newaxis, :, :]
+            m = head_mask if head_mask.shape == (mh, mw) else cv2.resize(
+                head_mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
+            u_vis = u_np * m[np.newaxis, :, :]
+        else:
+            u_vis = u_np
 
         u_mag = np.sqrt(u_vis[0] ** 2 + u_vis[1] ** 2)
         u_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_COOL,
@@ -566,6 +607,11 @@ def run(args: argparse.Namespace) -> None:
     # lwcc is the density source — load once, reuse every frame
     lwcc_model, lwcc_get_count, lwcc_tmp = _load_lwcc(args.lwcc_model, args.lwcc_weights, device)
 
+    # optional YOLO detector — replaces rho>tau mask with person bounding boxes
+    yolo_model = _load_yolo(args.detector, device) if args.detector else None
+    if yolo_model is not None and args.density_mask_tau != 0.01:
+        log.warning("--detector is active; --density-mask-tau is ignored.")
+
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
              args.source, src.width, src.height, src.fps,
@@ -575,14 +621,15 @@ def run(args: argparse.Namespace) -> None:
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    _masked = args.detector is not None or args.density_mask_tau > 0
     if args.per_capita:
-        p_formula = "Var(u[mask]) / (rho+eps)" if args.density_mask_tau > 0 else "Var(u) / (rho+eps)"
+        p_formula = "Var(u[mask]) / (rho+eps)" if _masked else "Var(u) / (rho+eps)"
     elif args.rho_alpha == 1.0:
-        p_formula = "rho * Var(u[mask])" if args.density_mask_tau > 0 else "rho * Var(u)"
+        p_formula = "rho * Var(u[mask])" if _masked else "rho * Var(u)"
     elif args.rho_alpha == 0.0:
-        p_formula = "Var(u[mask])" if args.density_mask_tau > 0 else "Var(u)"
+        p_formula = "Var(u[mask])" if _masked else "Var(u)"
     else:
-        suffix = "[mask]" if args.density_mask_tau > 0 else ""
+        suffix = "[mask]" if _masked else ""
         p_formula = f"rho^{args.rho_alpha:g} * Var(u{suffix})"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
@@ -605,8 +652,7 @@ def run(args: argparse.Namespace) -> None:
             tmp_path=lwcc_tmp,
         )
         dash = _build_dashboard(frame_resized, rho_np, None, None,
-                                history, threshold, 0.0, 0, None,
-                                density_mask_tau=args.density_mask_tau)
+                                history, threshold, 0.0, 0, None)
         if out_dir:
             cv2.imwrite(str(out_dir / "image_dashboard.png"), dash)
             log.info("Saved %s", out_dir / "image_dashboard.png")
@@ -650,8 +696,16 @@ def run(args: argparse.Namespace) -> None:
                     args.lwcc_model, target_hw=(u_np.shape[1], u_np.shape[2]),
                     tmp_path=lwcc_tmp,
                 )
-                head_mask = _head_mask(rho_np, args.density_mask_tau) \
-                    if args.density_mask_tau > 0.0 else None
+                if yolo_model is not None:
+                    head_mask = _yolo_person_mask(
+                        frame_resized, yolo_model,
+                        target_hw=(u_np.shape[1], u_np.shape[2]),
+                        conf=args.detector_conf,
+                    )
+                elif args.density_mask_tau > 0.0:
+                    head_mask = _head_mask(rho_np, args.density_mask_tau)
+                else:
+                    head_mask = None
 
                 # Smooth u to suppress RAFT noise without introducing edges.
                 # Spatial Gaussian first, then temporal EMA across frames.
@@ -686,7 +740,7 @@ def run(args: argparse.Namespace) -> None:
             dash = _build_dashboard(
                 display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max, p_formula=p_formula,
-                density_mask_tau=args.density_mask_tau,
+                head_mask=head_mask,
             )
 
             if out_dir and writer is None:
@@ -798,6 +852,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lwcc-weights", default="SHA",
                    choices=("SHA", "SHB", "QNRF"),
                    help="lwcc pretrained weights (default: SHA).")
+    # YOLO person detector — overrides lwcc density mask when set
+    p.add_argument("--detector", default=None,
+                   help="Ultralytics YOLO model for person detection mask, e.g. "
+                        "'yolo26n.pt', 'yolo11n.pt', 'yolo12n.pt'. "
+                        "Overrides --density-mask-tau. Omit to use lwcc mask only.")
+    p.add_argument("--detector-conf", type=float, default=0.25,
+                   help="YOLO confidence threshold for person detections (default 0.25).")
     return p.parse_args()
 
 
