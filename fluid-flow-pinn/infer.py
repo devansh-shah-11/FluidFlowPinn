@@ -680,10 +680,11 @@ def run(args: argparse.Namespace) -> None:
             frame_resized = cv2.resize(frame, (inf_w, inf_h))
             cur_tensor = _bgr_to_tensor(frame_resized, device)
 
-            rho_np: Optional[np.ndarray] = None
-            u_np:   Optional[np.ndarray] = None
-            P_np:   Optional[np.ndarray] = None
-            p_max:  Optional[float] = None
+            rho_np:    Optional[np.ndarray] = None
+            u_np:      Optional[np.ndarray] = None
+            P_np:      Optional[np.ndarray] = None
+            p_max:     Optional[float] = None
+            head_mask: Optional[np.ndarray] = None
 
             if prev_tensor is not None:
                 with autocast(device_type=device.type, enabled=use_fp16):
