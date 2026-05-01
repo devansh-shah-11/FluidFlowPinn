@@ -15,3 +15,4 @@ torchvision==0.26.0
 tqdm
 wandb==0.26.0
 lwcc==0.0.7
+ultralytics==8.4.46
