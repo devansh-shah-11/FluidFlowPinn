@@ -124,6 +124,7 @@ class _Source:
 def _load_model(
     checkpoint_path: Optional[Path],
     device: torch.device,
+    raft_iters: int = 6,
 ) -> tuple:
     """Load RAFT flow branch only — density is handled by lwcc externally.
 
@@ -150,16 +151,17 @@ def _load_model(
         full_sd = ckpt["model"]
         flow_sd = {k[len("flow_branch."):]: v
                    for k, v in full_sd.items() if k.startswith("flow_branch.")}
-        flow_branch = load_raft(frozen=True).to(device)
+        flow_branch = load_raft(frozen=True, num_flow_updates=raft_iters).to(device)
         flow_branch.load_state_dict(flow_sd)
         flow_branch.eval()
-        log.info("RAFT loaded from checkpoint (epoch %s) | device=%s fp16=%s",
-                 ckpt.get("epoch", "?"), device, use_fp16)
+        log.info("RAFT loaded from checkpoint (epoch %s) | device=%s fp16=%s iters=%d",
+                 ckpt.get("epoch", "?"), device, use_fp16, raft_iters)
         return flow_branch, cfg, use_fp16
 
     cfg = {}
-    log.info("Loading torchvision-pretrained RAFT | device=%s fp16=%s", device, use_fp16)
-    flow_branch = load_raft(frozen=True).to(device)
+    log.info("Loading torchvision-pretrained RAFT | device=%s fp16=%s iters=%d",
+             device, use_fp16, raft_iters)
+    flow_branch = load_raft(frozen=True, num_flow_updates=raft_iters).to(device)
     flow_branch.eval()
     log.info("RAFT ready.")
     return flow_branch, cfg, use_fp16
@@ -222,8 +224,8 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     return np.clip(var, 0.0, None)
 
 
-def _load_lwcc(model_name: str, model_weights: str):
-    """Load lwcc crowd-counting model once; returns (model, get_count_fn)."""
+def _load_lwcc(model_name: str, model_weights: str, device: torch.device):
+    """Load lwcc crowd-counting model; move it to `device`; return (model, get_count_fn, tmp_path)."""
     try:
         from lwcc.LWCC import load_model, get_count
     except ImportError:
@@ -231,8 +233,13 @@ def _load_lwcc(model_name: str, model_weights: str):
         sys.exit(1)
     log.info("Loading lwcc %s/%s …", model_name, model_weights)
     m = load_model(model_name=model_name, model_weights=model_weights)
-    log.info("lwcc ready.")
-    return m, get_count
+    m.to(device)
+    m.eval()
+    log.info("lwcc ready on %s.", device)
+    # Pre-allocate a persistent temp file so per-frame create/delete overhead is gone.
+    tmp_f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_f.close()
+    return m, get_count, tmp_f.name
 
 
 def _lwcc_density_np(
@@ -241,21 +248,22 @@ def _lwcc_density_np(
     lwcc_get_count,
     model_name: str,
     target_hw: tuple[int, int],
+    tmp_path: str,
 ) -> np.ndarray:
-    """Run lwcc on a BGR frame and return density map resized to target_hw (H, W)."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        cv2.imwrite(tmp, bgr)
-        _, density = lwcc_get_count(
-            tmp,
-            model_name=model_name,
-            model=lwcc_model,
-            return_density=True,
-            resize_img=False,
-        )
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+    """Run lwcc on a BGR frame and return density map resized to target_hw (H, W).
+
+    lwcc's get_count loads images on CPU and calls model(imgs) without moving to GPU.
+    We call model inference ourselves so the tensor stays on the model's device.
+    """
+    from lwcc.util.functions import load_image as lwcc_load_image
+    cv2.imwrite(tmp_path, bgr)
+    img_tensor, _ = lwcc_load_image(tmp_path, model_name, is_gray=False, resize_img=False)
+    # img_tensor shape: (1, 3, H, W) on CPU — move to model device
+    device = next(lwcc_model.parameters()).device
+    img_tensor = img_tensor.to(device, non_blocking=True)
+    with torch.no_grad():
+        output = lwcc_model(img_tensor)  # (1, 1, H', W')
+    density = output[0, 0].cpu().numpy()
     rho = np.array(density, dtype=np.float32)
     H, W = target_hw
     if rho.shape != (H, W):
@@ -542,11 +550,12 @@ def _build_dashboard(
 @torch.no_grad()
 def run(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Using device: %s", device)
     ckpt = Path(args.checkpoint) if args.checkpoint else None
-    model, cfg, use_fp16 = _load_model(ckpt, device)
+    model, cfg, use_fp16 = _load_model(ckpt, device, raft_iters=args.raft_iters)
 
     # lwcc is the density source — load once, reuse every frame
-    lwcc_model, lwcc_get_count = _load_lwcc(args.lwcc_model, args.lwcc_weights)
+    lwcc_model, lwcc_get_count, lwcc_tmp = _load_lwcc(args.lwcc_model, args.lwcc_weights, device)
 
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
@@ -584,6 +593,7 @@ def run(args: argparse.Namespace) -> None:
         rho_np = _lwcc_density_np(
             frame_resized, lwcc_model, lwcc_get_count,
             args.lwcc_model, target_hw=(inf_h // 8, inf_w // 8),
+            tmp_path=lwcc_tmp,
         )
         dash = _build_dashboard(frame_resized, rho_np, None, None,
                                 history, threshold, 0.0, 0, None)
@@ -628,6 +638,7 @@ def run(args: argparse.Namespace) -> None:
                 rho_np = _lwcc_density_np(
                     frame_resized, lwcc_model, lwcc_get_count,
                     args.lwcc_model, target_hw=(u_np.shape[1], u_np.shape[2]),
+                    tmp_path=lwcc_tmp,
                 )
                 head_mask = _head_mask(rho_np, args.density_mask_tau) \
                     if args.density_mask_tau > 0.0 else None
@@ -700,6 +711,7 @@ def run(args: argparse.Namespace) -> None:
             writer.release()
         if args.display:
             cv2.destroyAllWindows()
+        Path(lwcc_tmp).unlink(missing_ok=True)
 
     # ── Final timeline png ───────────────────────────────────────────────
     if out_dir and all_scores:
@@ -754,6 +766,10 @@ def _parse_args() -> argparse.Namespace:
                         "top fraction), weighted_mean (rho-weighted average).")
     p.add_argument("--topk-frac", type=float, default=0.001,
                    help="Fraction of pixels for --p-agg topk (default 0.001 = 0.1%%).")
+    # RAFT speed vs accuracy
+    p.add_argument("--raft-iters", type=int, default=6,
+                   help="Number of RAFT flow update iterations (default 6). "
+                        "Use 4 for max speed, 12 for max accuracy.")
     # RAFT noise suppression — smooth, edge-free
     p.add_argument("--flow-spatial-sigma", type=float, default=0.0,
                    help="Gaussian sigma (in H/8-grid pixels) for spatial smooth on u "
