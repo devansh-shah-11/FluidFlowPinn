@@ -458,6 +458,7 @@ def _build_dashboard(
     p_max: Optional[float],
     pressure_window: int = 5,
     p_formula: str = "rho * Var(u)",
+    density_mask_tau: float = 0.0,
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
@@ -494,13 +495,21 @@ def _build_dashboard(
 
     # Row 2 — |u| (with arrows) + Var(u)
     if u_np is not None:
-        u_mag = np.sqrt(u_np[0] ** 2 + u_np[1] ** 2)
+        # Apply head mask to visualization so arrows/heatmap only show where people are.
+        u_vis = u_np
+        if density_mask_tau > 0.0 and rho_np is not None:
+            mh, mw = u_np.shape[1], u_np.shape[2]
+            mask = rho_np if rho_np.shape == (mh, mw) else cv2.resize(
+                rho_np, (mw, mh), interpolation=cv2.INTER_NEAREST)
+            u_vis = u_np * (mask > density_mask_tau).astype(np.float32)[np.newaxis, :, :]
+
+        u_mag = np.sqrt(u_vis[0] ** 2 + u_vis[1] ** 2)
         u_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_COOL,
                                   alpha=0.45, vmin=0.0)
-        u_pane = _flow_arrows(u_pane, u_np, step=24, scale=1.0)
+        u_pane = _flow_arrows(u_pane, u_vis, step=24, scale=1.0)
         _label(u_pane, f"|u|  max={u_mag.max():.2f} px/frame")
 
-        var_u = _local_var_np(u_np, k=pressure_window)
+        var_u = _local_var_np(u_vis, k=pressure_window)
         var_pane = _heatmap_overlay(fr, var_u, cmap=cv2.COLORMAP_PLASMA,
                                     alpha=0.55, vmin=0.0)
         _label(var_pane, f"Var(u)  max={var_u.max():.2f}")
@@ -596,7 +605,8 @@ def run(args: argparse.Namespace) -> None:
             tmp_path=lwcc_tmp,
         )
         dash = _build_dashboard(frame_resized, rho_np, None, None,
-                                history, threshold, 0.0, 0, None)
+                                history, threshold, 0.0, 0, None,
+                                density_mask_tau=args.density_mask_tau)
         if out_dir:
             cv2.imwrite(str(out_dir / "image_dashboard.png"), dash)
             log.info("Saved %s", out_dir / "image_dashboard.png")
@@ -676,6 +686,7 @@ def run(args: argparse.Namespace) -> None:
             dash = _build_dashboard(
                 display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max, p_formula=p_formula,
+                density_mask_tau=args.density_mask_tau,
             )
 
             if out_dir and writer is None:
@@ -778,9 +789,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Temporal EMA on u: u_t = alpha*u + (1-alpha)*u_{t-1}. "
                         "1.0 disables. Try 0.4 .. 0.6.")
     # Head-mask-gated variance via lwcc density
-    p.add_argument("--density-mask-tau", type=float, default=0.0,
+    p.add_argument("--density-mask-tau", type=float, default=0.01,
                    help="Density threshold τ for head mask. Var(u) is computed only "
-                        "where lwcc density > τ. 0 disables (default). Try 0.01.")
+                        "where lwcc density > τ (default 0.01). Set 0 to disable.")
     p.add_argument("--lwcc-model",   default="DM-Count",
                    choices=("CSRNet", "SFANet", "Bay", "DM-Count"),
                    help="lwcc model for head masking (default: DM-Count).")
