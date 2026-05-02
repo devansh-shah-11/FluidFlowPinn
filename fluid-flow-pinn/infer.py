@@ -319,12 +319,16 @@ def _yolo_person_mask(
     mask = np.zeros((H_out, W_out), dtype=np.float32)
     sx = W_out / W_src
     sy = H_out / H_src
-    r = center_radius
     for box in person_xyxy:
-        cx = int((box[0] + box[2]) / 2 * sx)
-        cy = int((box[1] + box[3]) / 2 * sy)
-        x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
-        y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
+        if center_radius < 0:  # -1 = full box
+            x1 = max(0, int(box[0] * sx));  x2 = min(W_out, int(box[2] * sx))
+            y1 = max(0, int(box[1] * sy));  y2 = min(H_out, int(box[3] * sy))
+        else:
+            cx = int((box[0] + box[2]) / 2 * sx)
+            cy = int((box[1] + box[3]) / 2 * sy)
+            r  = center_radius
+            x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
+            y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
         mask[y1:y2, x1:x2] = 1.0
     return mask, person_xyxy
 
@@ -347,13 +351,18 @@ def _boxes_to_density(
     if boxes_xyxy is None or len(boxes_xyxy) == 0:
         return rho
     sx, sy = W_out / W_src, H_out / H_src
-    r = center_radius
     for box in boxes_xyxy:
-        cx = int((box[0] + box[2]) / 2 * sx)
-        cy = int((box[1] + box[3]) / 2 * sy)
-        x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
-        y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
-        rho[y1:y2, x1:x2] += 1.0
+        if center_radius < 0:  # -1 = full box
+            x1 = max(0, int(box[0] * sx));  x2 = min(W_out, int(box[2] * sx))
+            y1 = max(0, int(box[1] * sy));  y2 = min(H_out, int(box[3] * sy))
+        else:
+            cx = int((box[0] + box[2]) / 2 * sx)
+            cy = int((box[1] + box[3]) / 2 * sy)
+            r  = center_radius
+            x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
+            y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
+        if x2 > x1 and y2 > y1:
+            rho[y1:y2, x1:x2] += 1.0
     return rho
 
 
@@ -971,8 +980,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--center-radius", type=int, default=1,
                    help="Radius in flow-grid cells around each box centre used for "
                         "the person mask and density map (default 1 = 3x3 patch). "
-                        "Increase to cover more of the torso; decrease to 0 for a "
-                        "single grid cell.")
+                        "0 = single grid cell, -1 = full bounding box (disables centre mode).")
     return p.parse_args()
 
 
