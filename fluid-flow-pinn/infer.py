@@ -426,43 +426,49 @@ def _temporal_ema(
 def _compute_pressure_np(
     rho_np: Optional[np.ndarray],
     u_np: np.ndarray,
-    window: int,
-    rho_alpha: float,
-    per_capita: bool,
-    per_capita_eps: float,
+    p_alpha: float = 1.0,
+    p_beta: float = 1.0,
     mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Recompute P from ρ and (denoised) u with configurable coupling.
+    """Compute crowd pressure as P = α*(N/area) + β*mean_speed_in_boxes.
 
-    mask: optional float32 (H', W') binary array from _head_mask(). When given,
-          flow vectors outside the mask are zeroed before Var(u) is computed so
-          that clothing/background motion doesn't pollute the variance.
+    Two independently weighted terms capture both stampede conditions:
+      - dense static crush  : high N/area  → α term dominates
+      - fast-moving stampede: high |u|     → β term dominates
 
-    Coupling modes:
-      • per_capita=True : P = Var(u) / (rho + eps)  — flags per-capita turbulence
-      • else            : P = (rho ** rho_alpha) * Var(u)
-        - rho_alpha=1 reproduces the original P = rho * Var(u)
-        - rho_alpha=0 gives P = Var(u) (decoupled from density)
+    Both terms are normalised to [0, 1] per-frame before weighting so α and β
+    are directly comparable regardless of absolute magnitude.
+
+    mask: float32 (H', W') binary 0/1 array. Flow outside the mask is zeroed so
+          background motion doesn't pollute the speed term.
+    When rho_np is None, only the speed term is computed (α has no effect).
     """
+    # Gate flow to mask region
     if mask is not None:
-        # resize mask to flow grid if needed, then gate flow
         mh, mw = u_np.shape[1], u_np.shape[2]
-        m = mask if mask.shape == (mh, mw) else cv2.resize(mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
+        m = mask if mask.shape == (mh, mw) else cv2.resize(
+            mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
         u_np = u_np * m[np.newaxis, :, :]
 
-    var_u = _local_var_np(u_np, k=window)  # (Hf, Wf)
+    # β term — per-pixel flow speed
+    u_mag = np.sqrt(u_np[0] ** 2 + u_np[1] ** 2)  # (Hf, Wf)
+    u_max = float(u_mag.max())
+    speed_term = u_mag / (u_max + 1e-8)  # normalise to [0, 1]
+
     if rho_np is None:
-        return var_u   # pure Var(u), equivalent to --rho-alpha 0
+        return speed_term
+
+    # Resize speed term to rho grid if needed
     h, w = rho_np.shape[-2:]
-    if var_u.shape != (h, w):
-        var_u = cv2.resize(var_u, (w, h), interpolation=cv2.INTER_LINEAR)
-    if per_capita:
-        return var_u / (rho_np.astype(np.float32) + per_capita_eps)
-    if rho_alpha == 1.0:
-        return rho_np.astype(np.float32) * var_u
-    if rho_alpha == 0.0:
-        return var_u
-    return (rho_np.astype(np.float32) ** rho_alpha) * var_u
+    if speed_term.shape != (h, w):
+        speed_term = cv2.resize(speed_term, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # α term — local density (rho already integrates to N, values in [0, ~2+])
+    rho = rho_np.astype(np.float32)
+    rho_max = float(rho.max())
+    density_term = rho / (rho_max + 1e-8)  # normalise to [0, 1]
+
+    return p_alpha * density_term + p_beta * speed_term
 
 
 def _flow_arrows(
@@ -601,13 +607,13 @@ def _build_dashboard(
         u_pane = _flow_arrows(u_pane, u_vis, step=24, scale=1.0)
         _label(u_pane, f"|u|  max={u_mag.max():.2f} px/frame")
 
-        var_u = _local_var_np(u_vis, k=pressure_window)
-        var_pane = _heatmap_overlay(fr, var_u, cmap=cv2.COLORMAP_PLASMA,
+        # Show speed magnitude as the second row-2 panel (replaces Var(u))
+        var_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_PLASMA,
                                     alpha=0.55, vmin=0.0)
-        _label(var_pane, f"Var(u)  max={var_u.max():.2f}")
+        _label(var_pane, f"|u| heat  max={u_mag.max():.2f}")
     else:
         u_pane = fr.copy(); _label(u_pane, "|u|  (need 2 frames)")
-        var_pane = fr.copy(); _label(var_pane, "Var(u)  (need 2 frames)")
+        var_pane = fr.copy(); _label(var_pane, "|u| heat  (need 2 frames)")
 
     # Row 3 — P + status
     if P_np is not None:
@@ -690,17 +696,11 @@ def run(args: argparse.Namespace) -> None:
     _yolo_rho = yolo_model is not None and lwcc_model is None
     rho_tag  = "rho(yolo)" if _yolo_rho else "rho"
 
+    mask_suffix = "[mask]" if _masked else ""
     if lwcc_model is None and yolo_model is None:
-        p_formula = "Var(u[mask])" if _masked else "Var(u)"
-    elif args.per_capita:
-        p_formula = f"Var(u[mask]) / ({rho_tag}+eps)" if _masked else f"Var(u) / ({rho_tag}+eps)"
-    elif args.rho_alpha == 1.0:
-        p_formula = f"{rho_tag} * Var(u[mask])" if _masked else f"{rho_tag} * Var(u)"
-    elif args.rho_alpha == 0.0:
-        p_formula = "Var(u[mask])" if _masked else "Var(u)"
+        p_formula = f"speed{mask_suffix}"
     else:
-        suffix = "[mask]" if _masked else ""
-        p_formula = f"{rho_tag}^{args.rho_alpha:g} * Var(u{suffix})"
+        p_formula = f"α*{rho_tag} + β*speed{mask_suffix}"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
     history: deque[float] = deque(maxlen=history_len)
@@ -814,10 +814,8 @@ def run(args: argparse.Namespace) -> None:
 
                 P_np = _compute_pressure_np(
                     rho_np, u_np,
-                    window=cfg.get("model", {}).get("pressure_window", 5),
-                    rho_alpha=args.rho_alpha,
-                    per_capita=args.per_capita,
-                    per_capita_eps=args.per_capita_eps,
+                    p_alpha=args.p_alpha,
+                    p_beta=args.p_beta,
                     mask=head_mask,
                 )
 
@@ -916,14 +914,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--height",     type=int, default=720,
                    help="Inference height — frames are resized to this (must be /8)")
     # Fix #1 — decouple ρ and Var(u) in the danger score
-    p.add_argument("--rho-alpha",   type=float, default=1.0,
-                   help="Exponent on rho in P = rho^alpha * Var(u). "
-                        "1.0 = original; 0.0 = Var(u) only; 0.25 = mild coupling.")
-    p.add_argument("--per-capita",  action="store_true",
-                   help="Use P = Var(u) / (rho + eps) — per-capita turbulence. "
-                        "Overrides --rho-alpha.")
-    p.add_argument("--per-capita-eps", type=float, default=1e-3,
-                   help="Epsilon in per-capita denominator (default 1e-3).")
+    p.add_argument("--p-alpha", type=float, default=1.0,
+                   help="Weight for the density term in P = α*(N/area) + β*speed. "
+                        "Increase to make dense crowds dominate the score (default 1.0).")
+    p.add_argument("--p-beta",  type=float, default=1.0,
+                   help="Weight for the speed term in P = α*(N/area) + β*speed. "
+                        "Increase to make fast-moving crowds dominate the score (default 1.0).")
     # Aggregator — how to reduce P-map to a scalar danger score
     p.add_argument("--p-agg", choices=("max", "topk", "weighted_mean"),
                    default="max",
