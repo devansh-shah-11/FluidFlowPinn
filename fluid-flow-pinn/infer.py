@@ -224,8 +224,12 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     return np.clip(var, 0.0, None)
 
 
-def _load_lwcc(model_name: str, model_weights: str, device: torch.device):
-    """Load lwcc crowd-counting model; move it to `device`; return (model, get_count_fn, tmp_path)."""
+def _load_lwcc(model_name: Optional[str], model_weights: str, device: torch.device):
+    """Load lwcc crowd-counting model; move it to `device`; return (model, get_count_fn, tmp_path).
+    Returns (None, None, None) when model_name is None (lwcc disabled)."""
+    if model_name is None:
+        log.info("lwcc disabled — skipping crowd-counting model.")
+        return None, None, None
     try:
         from lwcc.LWCC import load_model, get_count
     except ImportError:
@@ -321,6 +325,31 @@ def _yolo_person_mask(
     return mask, person_xyxy
 
 
+def _boxes_to_density(
+    boxes_xyxy: np.ndarray,
+    src_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+) -> np.ndarray:
+    """Synthesize a float32 density map from YOLO bounding boxes.
+
+    Each detected person box contributes uniform 1.0 to its region so that
+    sum(rho) ≈ N (number of detected people), matching lwcc's convention.
+    Overlapping boxes accumulate (+=), naturally representing higher local density.
+    """
+    H_src, W_src = src_hw
+    H_out, W_out = target_hw
+    rho = np.zeros((H_out, W_out), dtype=np.float32)
+    if boxes_xyxy is None or len(boxes_xyxy) == 0:
+        return rho
+    sx, sy = W_out / W_src, H_out / H_src
+    for box in boxes_xyxy:
+        x1 = max(0, int(box[0] * sx));  y1 = max(0, int(box[1] * sy))
+        x2 = min(W_out, int(box[2] * sx)); y2 = min(H_out, int(box[3] * sy))
+        if x2 > x1 and y2 > y1:
+            rho[y1:y2, x1:x2] += 1.0
+    return rho
+
+
 def _denoise_flow(
     u_np: np.ndarray,
     spatial_sigma: float,
@@ -343,7 +372,7 @@ def _denoise_flow(
 
 def _aggregate_pressure(
     P_np: np.ndarray,
-    rho_np: np.ndarray,
+    rho_np: Optional[np.ndarray],
     mode: str,
     topk_frac: float,
 ) -> float:
@@ -365,6 +394,10 @@ def _aggregate_pressure(
         idx = np.argpartition(flat, -k)[-k:]
         return float(flat[idx].mean())
     if mode == "weighted_mean":
+        if rho_np is None:
+            flat = P_np.reshape(-1)
+            k = max(1, int(round(flat.size * topk_frac)))
+            return float(np.partition(flat, -k)[-k:].mean())
         w = rho_np.astype(np.float32)
         denom = float(w.sum())
         if denom <= 1e-9:
@@ -391,7 +424,7 @@ def _temporal_ema(
 
 
 def _compute_pressure_np(
-    rho_np: np.ndarray,
+    rho_np: Optional[np.ndarray],
     u_np: np.ndarray,
     window: int,
     rho_alpha: float,
@@ -418,6 +451,8 @@ def _compute_pressure_np(
         u_np = u_np * m[np.newaxis, :, :]
 
     var_u = _local_var_np(u_np, k=window)  # (Hf, Wf)
+    if rho_np is None:
+        return var_u   # pure Var(u), equivalent to --rho-alpha 0
     h, w = rho_np.shape[-2:]
     if var_u.shape != (h, w):
         var_u = cv2.resize(var_u, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -620,13 +655,27 @@ def run(args: argparse.Namespace) -> None:
     ckpt = Path(args.checkpoint) if args.checkpoint else None
     model, cfg, use_fp16 = _load_model(ckpt, device, raft_iters=args.raft_iters)
 
-    # lwcc is the density source — load once, reuse every frame
+    # Apply --no-lwcc override before loading
+    if args.no_lwcc:
+        args.lwcc_model = None
+
+    # lwcc is the density source — load once, reuse every frame (None if disabled)
     lwcc_model, lwcc_get_count, lwcc_tmp = _load_lwcc(args.lwcc_model, args.lwcc_weights, device)
 
-    # optional YOLO detector — replaces rho>tau mask with person bounding boxes
+    # optional YOLO detector — supplies head_mask and (when lwcc absent) synthetic rho
     yolo_model = _load_yolo(args.detector, device) if args.detector else None
     if yolo_model is not None and args.density_mask_tau != 0.01:
         log.warning("--detector is active; --density-mask-tau is ignored.")
+
+    if lwcc_model is None and yolo_model is None:
+        log.warning(
+            "No density source active (no --lwcc-model, no --detector). "
+            "Running in pure-flow mode: P = Var(u)."
+        )
+    elif yolo_model is not None and lwcc_model is None:
+        log.info("YOLO-only mode: rho synthesized from bounding boxes.")
+    elif yolo_model is not None and lwcc_model is not None:
+        log.info("Both YOLO and lwcc active: YOLO supplies head_mask, lwcc supplies rho.")
 
     src = _Source(args.source if not args.source.isdigit() else int(args.source))
     log.info("Source: %s | %dx%d @ %.1f fps | frames=%s",
@@ -637,16 +686,21 @@ def run(args: argparse.Namespace) -> None:
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    _masked = args.detector is not None or args.density_mask_tau > 0
-    if args.per_capita:
-        p_formula = "Var(u[mask]) / (rho+eps)" if _masked else "Var(u) / (rho+eps)"
+    _masked  = yolo_model is not None or args.density_mask_tau > 0
+    _yolo_rho = yolo_model is not None and lwcc_model is None
+    rho_tag  = "rho(yolo)" if _yolo_rho else "rho"
+
+    if lwcc_model is None and yolo_model is None:
+        p_formula = "Var(u[mask])" if _masked else "Var(u)"
+    elif args.per_capita:
+        p_formula = f"Var(u[mask]) / ({rho_tag}+eps)" if _masked else f"Var(u) / ({rho_tag}+eps)"
     elif args.rho_alpha == 1.0:
-        p_formula = "rho * Var(u[mask])" if _masked else "rho * Var(u)"
+        p_formula = f"{rho_tag} * Var(u[mask])" if _masked else f"{rho_tag} * Var(u)"
     elif args.rho_alpha == 0.0:
         p_formula = "Var(u[mask])" if _masked else "Var(u)"
     else:
         suffix = "[mask]" if _masked else ""
-        p_formula = f"rho^{args.rho_alpha:g} * Var(u{suffix})"
+        p_formula = f"{rho_tag}^{args.rho_alpha:g} * Var(u{suffix})"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
     history: deque[float] = deque(maxlen=history_len)
@@ -662,11 +716,21 @@ def run(args: argparse.Namespace) -> None:
         frame = src.read()
         assert frame is not None
         frame_resized = cv2.resize(frame, (inf_w, inf_h))
-        rho_np = _lwcc_density_np(
-            frame_resized, lwcc_model, lwcc_get_count,
-            args.lwcc_model, target_hw=(inf_h // 8, inf_w // 8),
-            tmp_path=lwcc_tmp,
-        )
+        target_hw = (inf_h // 8, inf_w // 8)
+        if lwcc_model is not None:
+            rho_np = _lwcc_density_np(
+                frame_resized, lwcc_model, lwcc_get_count,
+                args.lwcc_model, target_hw=target_hw,
+                tmp_path=lwcc_tmp,
+            )
+        elif yolo_model is not None:
+            _, boxes_img = _yolo_person_mask(
+                frame_resized, yolo_model, target_hw=target_hw,
+                conf=args.detector_conf,
+            )
+            rho_np = _boxes_to_density(boxes_img, frame_resized.shape[:2], target_hw)
+        else:
+            rho_np = None
         dash = _build_dashboard(frame_resized, rho_np, None, None,
                                 history, threshold, 0.0, 0, None)
         if out_dir:
@@ -708,21 +772,38 @@ def run(args: argparse.Namespace) -> None:
                     u_t = model(prev_tensor, cur_tensor)
                 u_np = u_t.squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
 
-                # lwcc density — primary source for rho and head mask
-                rho_np = _lwcc_density_np(
-                    frame_resized, lwcc_model, lwcc_get_count,
-                    args.lwcc_model, target_hw=(u_np.shape[1], u_np.shape[2]),
-                    tmp_path=lwcc_tmp,
-                )
+                target_hw = (u_np.shape[1], u_np.shape[2])
+
+                # ── Density source selection ─────────────────────────────────
                 if yolo_model is not None:
                     head_mask, yolo_boxes = _yolo_person_mask(
                         frame_resized, yolo_model,
-                        target_hw=(u_np.shape[1], u_np.shape[2]),
+                        target_hw=target_hw,
                         conf=args.detector_conf,
                     )
-                elif args.density_mask_tau > 0.0:
-                    head_mask = _head_mask(rho_np, args.density_mask_tau)
+                    if lwcc_model is not None:
+                        # Both active: lwcc is authoritative rho; YOLO supplies head_mask.
+                        rho_np = _lwcc_density_np(
+                            frame_resized, lwcc_model, lwcc_get_count,
+                            args.lwcc_model, target_hw=target_hw,
+                            tmp_path=lwcc_tmp,
+                        )
+                    else:
+                        # YOLO-only: synthesize rho from bounding boxes.
+                        rho_np = _boxes_to_density(
+                            yolo_boxes, frame_resized.shape[:2], target_hw
+                        )
+                elif lwcc_model is not None:
+                    # Original lwcc-only path.
+                    rho_np = _lwcc_density_np(
+                        frame_resized, lwcc_model, lwcc_get_count,
+                        args.lwcc_model, target_hw=target_hw,
+                        tmp_path=lwcc_tmp,
+                    )
+                    head_mask = _head_mask(rho_np, args.density_mask_tau) if args.density_mask_tau > 0.0 else None
                 else:
+                    # No density source: pure flow mode.
+                    rho_np = None
                     head_mask = None
 
                 # Smooth u to suppress RAFT noise without introducing edges.
@@ -794,7 +875,8 @@ def run(args: argparse.Namespace) -> None:
             writer.release()
         if args.display:
             cv2.destroyAllWindows()
-        Path(lwcc_tmp).unlink(missing_ok=True)
+        if lwcc_tmp is not None:
+            Path(lwcc_tmp).unlink(missing_ok=True)
 
     # ── Final timeline png ───────────────────────────────────────────────
     if out_dir and all_scores:
@@ -864,12 +946,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--density-mask-tau", type=float, default=0.01,
                    help="Density threshold τ for head mask. Var(u) is computed only "
                         "where lwcc density > τ (default 0.01). Set 0 to disable.")
-    p.add_argument("--lwcc-model",   default="DM-Count",
-                   choices=("CSRNet", "SFANet", "Bay", "DM-Count"),
-                   help="lwcc model for head masking (default: DM-Count).")
+    p.add_argument("--lwcc-model",   default=None,
+                   help="lwcc crowd-counting model: CSRNet, SFANet, Bay, DM-Count. "
+                        "Omit to synthesize density from YOLO boxes (requires --detector). "
+                        "Previously defaulted to DM-Count — now must be set explicitly.")
     p.add_argument("--lwcc-weights", default="SHA",
                    choices=("SHA", "SHB", "QNRF"),
-                   help="lwcc pretrained weights (default: SHA).")
+                   help="lwcc pretrained weights (default: SHA). Ignored if --lwcc-model not set.")
+    p.add_argument("--no-lwcc",      action="store_true",
+                   help="Explicitly disable lwcc even if --lwcc-model is set.")
     # YOLO person detector — overrides lwcc density mask when set
     p.add_argument("--detector", default=None,
                    help="Ultralytics YOLO model for person detection mask, e.g. "
