@@ -299,11 +299,14 @@ def _yolo_person_mask(
     yolo_model,
     target_hw: tuple[int, int],
     conf: float = 0.25,
+    center_radius: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run YOLO on a BGR frame.
 
     Returns:
-        mask: float32 (0/1) mask of person bounding boxes resized to target_hw (H, W)
+        mask: float32 (0/1) mask at target_hw (H, W). Only a small patch of
+              radius `center_radius` grid cells around each box centre is set,
+              avoiding arm/leg/background pixels that inflate velocity variance.
         boxes_xyxy: (N, 4) array of person boxes in source-frame pixel coordinates
     """
     H_src, W_src = bgr.shape[:2]
@@ -316,11 +319,12 @@ def _yolo_person_mask(
     mask = np.zeros((H_out, W_out), dtype=np.float32)
     sx = W_out / W_src
     sy = H_out / H_src
+    r = center_radius
     for box in person_xyxy:
-        x1 = max(0, int(box[0] * sx))
-        y1 = max(0, int(box[1] * sy))
-        x2 = min(W_out, int(box[2] * sx))
-        y2 = min(H_out, int(box[3] * sy))
+        cx = int((box[0] + box[2]) / 2 * sx)
+        cy = int((box[1] + box[3]) / 2 * sy)
+        x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
+        y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
         mask[y1:y2, x1:x2] = 1.0
     return mask, person_xyxy
 
@@ -329,12 +333,13 @@ def _boxes_to_density(
     boxes_xyxy: np.ndarray,
     src_hw: tuple[int, int],
     target_hw: tuple[int, int],
+    center_radius: int = 1,
 ) -> np.ndarray:
     """Synthesize a float32 density map from YOLO bounding boxes.
 
-    Each detected person box contributes uniform 1.0 to its region so that
-    sum(rho) ≈ N (number of detected people), matching lwcc's convention.
-    Overlapping boxes accumulate (+=), naturally representing higher local density.
+    Stamps 1.0 at a small patch around each box centre (radius = center_radius
+    grid cells) rather than filling the whole box, so sum(rho) ≈ N and
+    neighbouring persons accumulate naturally when they are close together.
     """
     H_src, W_src = src_hw
     H_out, W_out = target_hw
@@ -342,11 +347,13 @@ def _boxes_to_density(
     if boxes_xyxy is None or len(boxes_xyxy) == 0:
         return rho
     sx, sy = W_out / W_src, H_out / H_src
+    r = center_radius
     for box in boxes_xyxy:
-        x1 = max(0, int(box[0] * sx));  y1 = max(0, int(box[1] * sy))
-        x2 = min(W_out, int(box[2] * sx)); y2 = min(H_out, int(box[3] * sy))
-        if x2 > x1 and y2 > y1:
-            rho[y1:y2, x1:x2] += 1.0
+        cx = int((box[0] + box[2]) / 2 * sx)
+        cy = int((box[1] + box[3]) / 2 * sy)
+        x1 = max(0, cx - r);  x2 = min(W_out, cx + r + 1)
+        y1 = max(0, cy - r);  y2 = min(H_out, cy + r + 1)
+        rho[y1:y2, x1:x2] += 1.0
     return rho
 
 
@@ -726,9 +733,10 @@ def run(args: argparse.Namespace) -> None:
         elif yolo_model is not None:
             _, boxes_img = _yolo_person_mask(
                 frame_resized, yolo_model, target_hw=target_hw,
-                conf=args.detector_conf,
+                conf=args.detector_conf, center_radius=args.center_radius,
             )
-            rho_np = _boxes_to_density(boxes_img, frame_resized.shape[:2], target_hw)
+            rho_np = _boxes_to_density(boxes_img, frame_resized.shape[:2], target_hw,
+                                       center_radius=args.center_radius)
         else:
             rho_np = None
         dash = _build_dashboard(frame_resized, rho_np, None, None,
@@ -780,6 +788,7 @@ def run(args: argparse.Namespace) -> None:
                         frame_resized, yolo_model,
                         target_hw=target_hw,
                         conf=args.detector_conf,
+                        center_radius=args.center_radius,
                     )
                     if lwcc_model is not None:
                         # Both active: lwcc is authoritative rho; YOLO supplies head_mask.
@@ -791,7 +800,8 @@ def run(args: argparse.Namespace) -> None:
                     else:
                         # YOLO-only: synthesize rho from bounding boxes.
                         rho_np = _boxes_to_density(
-                            yolo_boxes, frame_resized.shape[:2], target_hw
+                            yolo_boxes, frame_resized.shape[:2], target_hw,
+                            center_radius=args.center_radius,
                         )
                 elif lwcc_model is not None:
                     # Original lwcc-only path.
@@ -958,6 +968,11 @@ def _parse_args() -> argparse.Namespace:
                         "Overrides --density-mask-tau. Omit to use lwcc mask only.")
     p.add_argument("--detector-conf", type=float, default=0.25,
                    help="YOLO confidence threshold for person detections (default 0.25).")
+    p.add_argument("--center-radius", type=int, default=1,
+                   help="Radius in flow-grid cells around each box centre used for "
+                        "the person mask and density map (default 1 = 3x3 patch). "
+                        "Increase to cover more of the torso; decrease to 0 for a "
+                        "single grid cell.")
     return p.parse_args()
 
 
