@@ -26,9 +26,22 @@
    - [Step 12: Inference-only pipeline (no training required)](#step-12-inference-only-pipeline-no-training-required)
    - [Step 13: Realtime dashboard — `infer.py`](#step-13-realtime-dashboard--inferpy)
    - [Step 14: Field findings on dense scenes — perspective bias](#step-14-field-findings-on-dense-scenes--perspective-bias)
-7. [Datasets](#7-datasets)
-8. [Design Decisions Log](#8-design-decisions-log)
-9. [Open Questions](#9-open-questions)
+7. [Experiments (Apr 30 – May 1 2026)](#7-experiments-apr-30--may-1-2026)
+   - [Exp 1: Ground-truth verification script](#exp-1-ground-truth-verification-script)
+   - [Exp 2: Adding lwcc (DM-Count) as the density source](#exp-2-adding-lwcc-dm-count-as-the-density-source)
+   - [Exp 3: Switching default density branch from CSRNet → lwcc](#exp-3-switching-default-density-branch-from-csrnet--lwcc)
+   - [Exp 4: Head-mask gating via density threshold τ](#exp-4-head-mask-gating-via-density-threshold-τ)
+   - [Exp 5: Configurable RAFT iteration count](#exp-5-configurable-raft-iteration-count)
+   - [Exp 6: Dashboard masking of flow visualisation via head masks](#exp-6-dashboard-masking-of-flow-visualisation-via-head-masks)
+   - [Exp 7: YOLO person detector as an alternative density source](#exp-7-yolo-person-detector-as-an-alternative-density-source)
+   - [Exp 8: YOLO bounding boxes in dashboard overlay](#exp-8-yolo-bounding-boxes-in-dashboard-overlay)
+   - [Exp 9: YOLO-only density (synthetic rho from boxes)](#exp-9-yolo-only-density-synthetic-rho-from-boxes)
+   - [Exp 10: Revised pressure formula — dual-term P = α·density + β·speed](#exp-10-revised-pressure-formula--dual-term-p--αdensity--βspeed)
+   - [Exp 11: Center-pixel velocity sampling](#exp-11-center-pixel-velocity-sampling)
+   - [Exp 12: Full-box mask mode (center_radius = -1)](#exp-12-full-box-mask-mode-center_radius---1)
+8. [Datasets](#8-datasets)
+9. [Design Decisions Log](#9-design-decisions-log)
+10. [Open Questions](#10-open-questions)
 
 ---
 
@@ -649,7 +662,223 @@ Each colored panel has an embedded label with the salient scalar (e.g. `rho sum=
 
 ---
 
-## 7. Datasets
+## 7. Experiments (Apr 30 – May 1 2026)
+
+This section chronicles every concrete iteration made during the two-day sprint to get a usable, fast, mask-gated pressure dashboard. Each experiment includes what was tried, why, and whether it worked.
+
+---
+
+### Exp 1: Ground-truth verification script
+
+**Date:** 2026-04-30  
+**Commit:** `dea9afe` — *script to verify outputs of groundtruth*  
+**File:** `fluid-flow-pinn/scripts/diagnose_outputs.py`
+
+**What:** Wrote a standalone 209-line diagnostic script that loads a single image (test: `150.jpg`), runs the full CSRNet + RAFT pipeline, and prints a per-panel diagnostic — predicted density sum, flow magnitude stats, pressure max, output image written to `diagnostic.png`.
+
+**Why:** After Step 14 (perspective bias), we couldn't tell whether the broken outputs were from the model, the dashboard rendering, or a data-loading artefact. Running inference end-to-end in isolation (without the full `infer.py` plumbing) let us inspect raw `rho_np`, `u_np`, and `P_np` tensors before any dashboard compositing. This is the "print statement" approach applied at the pipeline level.
+
+**Outcome:** Confirmed that CSRNet was running correctly and producing plausible counts on the test image. The main finding: `Var(u)` values were extremely large (up to ~1400) because RAFT was picking up background texture motion. This isolated the problem to the flow-gating step, not the density branch. **Directly motivated Exp 4 (head-mask tau) and Exp 7 (YOLO).**
+
+---
+
+### Exp 2: Adding lwcc (DM-Count) as the density source
+
+**Date:** 2026-04-30  
+**Commits:** `82e20d8` (add lwcc to requirements), `079e169b` (support lwcc in _load_lwcc)  
+**File:** `fluid-flow-pinn/infer.py`, `fluid-flow-pinn/requirements.txt`
+
+**What:** Integrated `lwcc` (Lightweight Crowd Counting library, wrapping DM-Count and other models) as an alternative density branch. Added `_load_lwcc(model_name, model_weights, device)` which loads any lwcc-supported model (e.g. `DM-Count`, `CSRNet`) via the lwcc API, moves it to device, and returns `(model, get_count_fn, tmp_path)`. The `tmp_path` is needed because lwcc's `get_count()` API writes the density map to a temporary file on disk rather than returning it as a tensor directly.
+
+**Why:** CSRNet (via ShanghaiTech weights) overcounts heavily on out-of-distribution scenes (cafeteria: ~124 predicted vs. ~22 real, see Step 11). DM-Count is a newer, more accurate density estimator with better generalisation. lwcc provides a clean pip-installable wrapper. The hypothesis was that a better density estimate would produce a more physically meaningful pressure map.
+
+**Outcome:** lwcc loaded correctly and produced density estimates. The initial integration left `lwcc_get_count` called with the global (CPU) `device` rather than moving the model to GPU, causing a device mismatch error on CUDA. Fixed in `20699e7` (Exp 5). **Worked once device was wired correctly — became the new default.**
+
+---
+
+### Exp 3: Switching default density branch from CSRNet → lwcc
+
+**Date:** 2026-04-30  
+**Commit:** `a7f8c67` — *switch to using lwcc instead of csrnet*  
+**Files:** `fluid-flow-pinn/infer.py` (major rewrite, 242-line diff)
+
+**What:** Refactored `_load_model()` to drop the CSRNet branch entirely from the inference path. The model loader now only loads the RAFT flow branch; density is computed by lwcc on each frame. Updated all CLI examples, removed `--csrnet-weights` from the primary inference path, and rewired the run loop to call `lwcc_get_count` for every frame.
+
+**Why:** With CSRNet out of the loop, `infer.py` no longer needs a ShanghaiTech `.pth` file to run — it works with just a video file. lwcc auto-downloads its own weights. This drastically lowers the barrier to running inference on new footage.
+
+**Why it worked:** DM-Count is a better-calibrated model for non-ShanghaiTech scenes. It handles perspective better internally because its training used multi-scale augmentation. The practical result was density maps with less "bleed" into background areas compared to CSRNet on oblique camera angles.
+
+**What broke / had to be fixed:** The lwcc API uses a temp-file round-trip (saves the density map to disk, returns a path). This added I/O overhead per frame (~20ms on SSD). Acceptable for offline video, problematic for realtime webcam. Documented in the code; future optimization would be to extract the internal density tensor before the file-write step.
+
+---
+
+### Exp 4: Head-mask gating via density threshold τ
+
+**Date:** 2026-04-30  
+**Commit:** `6ae1ddd` — *add tau to filter pixels based on head mask*  
+**File:** `fluid-flow-pinn/infer.py`
+
+**What:** Added `--density-mask-tau` (default 0.01) CLI flag. Before computing pressure, pixels where `rho < tau` are zeroed in the flow field `u_np`, so that background motion (camera shake, clothing texture, empty floor) does not contribute to the flow variance or speed terms. The resulting binary mask is called `head_mask`.
+
+**Why:** Exp 1's diagnostic revealed that `Var(u)` was inflated by background pixels — regions where density is near zero but RAFT still produces nonzero flow vectors (texture, shadows, rolling camera). Gating the flow to only the crowd-occupied region should drastically reduce false pressure readings in empty parts of the frame.
+
+**Why it worked:** On footage with clearly segregated "crowd region" vs. "background", tau=0.01 cleanly separates the two. The flow variance in the crowd region is genuinely higher than in the background, so gating correctly isolates the danger signal.
+
+**Why it sometimes fails:** On perspective footage where the entire background has low-but-nonzero `rho` (CSRNet or lwcc hallucinate density everywhere), tau=0.01 is too loose — nearly all pixels pass the threshold. The mask degenerates to all-ones. This is why YOLO was later added (Exp 7): YOLO bounding boxes give a crisp, density-independent mask.
+
+---
+
+### Exp 5: Configurable RAFT iteration count
+
+**Date:** 2026-05-01  
+**Commit:** `20699e7` — *Add raft_iters parameter to _load_model and _load_lwcc functions for configurable RAFT updates*  
+**File:** `fluid-flow-pinn/infer.py`
+
+**What:** Added `--raft-iters` CLI flag (default 6, original RAFT-Small paper default is 12). Threaded `raft_iters` through `_load_model()` and into `load_raft(num_flow_updates=raft_iters)`. Also fixed `_load_lwcc` to accept a `device` argument and properly call `.to(device).eval()` on the loaded model.
+
+**Why `raft_iters`:** RAFT uses a recurrent GRU to iteratively refine flow. 12 iterations gives the best quality; fewer iterations are faster but less accurate. With lwcc adding per-frame I/O overhead (Exp 3), reducing RAFT iterations from 12 → 6 was a practical speed knob. For dense crowd scenes with large smooth motion (5–30 px/frame), 6 iterations produces usable flow at ~2× the speed.
+
+**Why device fix was critical:** Without moving the lwcc model to GPU, every density estimate ran on CPU even when RAFT was on CUDA, causing a bottleneck and a device tensor mismatch when the density map was combined with the CUDA flow tensors.
+
+**Outcome:** Both issues fixed. Pipeline now runs fully on GPU. raft_iters=6 is the new default for realtime use; 12 is documented for offline accuracy.
+
+---
+
+### Exp 6: Dashboard masking of flow visualisation via head masks
+
+**Date:** 2026-05-01  
+**Commit:** `62f5298` — *dashboard masking of flow based on head masks*  
+**File:** `fluid-flow-pinn/infer.py`
+
+**What:** Applied `head_mask` to the flow visualisation panels in `_build_dashboard`. The `|u|` arrow panel and the speed/Var(u) heatmap are now rendered with flow vectors outside the mask zeroed, so the dashboard only shows arrows and heat where people actually are.
+
+**Why:** Previously, the dashboard showed flow arrows everywhere including background. This made the visualisation hard to read on busy backgrounds (trees, moving vehicles in peripheral camera view). Masking the visualisation (not just the pressure computation) makes it immediately obvious that the system is tracking people, not background.
+
+**Outcome:** Visually cleaner dashboard. Confirmed that the mask was working correctly — arrows disappeared from carpet/floor regions and concentrated on head locations.
+
+---
+
+### Exp 7: YOLO person detector as an alternative density source
+
+**Date:** 2026-05-01  
+**Commits:** `4f9e0d8` — *add yolo support*, `38451b3` — *yolo support for verifying outputs*  
+**File:** `fluid-flow-pinn/infer.py`
+
+**What:** Added `--detector` CLI flag (accepts any ultralytics YOLO model path or name, e.g. `yolo11n.pt`). Added `_load_yolo(model, device)` and `_yolo_person_mask(frame, model, target_hw, conf)` functions. YOLO runs on each frame, filters `class=person` detections, and returns a binary mask of person bounding boxes at the flow-grid resolution plus the raw `(N, 4)` box array.
+
+**Three operational modes introduced:**
+- `--detector` only (no `--lwcc-model`): YOLO-only mode — rho is synthesized from boxes (Exp 9)
+- `--lwcc-model` only (no `--detector`): lwcc-only mode — density is from DM-Count, head mask from density threshold τ
+- Both active: lwcc is the authoritative density source; YOLO supplies the head mask (crisp box-based mask instead of fuzzy density threshold)
+
+**Why YOLO for masking (even when lwcc is the density source):**
+The density-threshold mask (Exp 4) fails when lwcc "leaks" density into background regions. YOLO's person detector gives a hard-edged, semantically correct mask regardless of what lwcc outputs. When both are active, the best of both worlds: DM-Count's accurate density integral, YOLO's pixel-perfect spatial mask.
+
+**Why YOLO works as a standalone density source:**
+When `--lwcc-model` is disabled (e.g., to reduce latency on an edge device), YOLO bounding boxes give a reasonable spatial density map: each box contributes +1 to its region, overlapping boxes accumulate, sum = N detected persons. It matches lwcc's convention (sum ≈ count). Less accurate spatially than DM-Count but fast and requires no GPU-side density model.
+
+**Outcome:** YOLO masks dramatically cleaned up the pressure heatmap on footage with large empty regions. False high-pressure readings in background corners disappeared. Validated via `diagnose_outputs.py` extension (`38451b3`).
+
+---
+
+### Exp 8: YOLO bounding boxes in dashboard overlay
+
+**Date:** 2026-05-01  
+**Commit:** `a71f1fb` — *add yolo boxes in dashboard output*, `ce01c18` — *bounding boxes from yolo*  
+**File:** `fluid-flow-pinn/infer.py`
+
+**What:** When `--detector` is active, the dashboard input panel now overlays YOLO person bounding boxes as green rectangles with confidence scores. `_build_dashboard` receives the raw `boxes_xyxy` array and draws them on the display frame. Also introduced `_boxes_to_density()` as a named function (previously inline) — converts a `(N, 4)` box array at source resolution to a float32 density grid at the target flow-grid resolution.
+
+**Why:** The overlay makes it immediately obvious how many people YOLO detected and where, which is critical for understanding the pressure output — if the pressure map disagrees with where boxes are, there's a bug in the mask or density routing.
+
+**Also added:** `_load_lwcc` made optional (`model_name=None` → returns `(None, None, None)` cleanly with an info log), so `--no-lwcc` flag suppresses the density branch without code changes. `_aggregate_pressure` made robust for `rho_np=None` (YOLO-only mode: falls back to top-k mean of P rather than density-weighted mean).
+
+**Outcome:** Immediately revealed a coordinate scaling bug: boxes were drawn at source-frame coordinates but the display frame had been resized for inference. Fixed by passing the source-frame box array separately from the flow-grid box array, and scaling correctly when drawing. **Scaling bugs are invisible without the overlay — this was the right next step after Exp 7.**
+
+---
+
+### Exp 9: YOLO-only density (synthetic rho from boxes)
+
+**Date:** 2026-05-01  
+**Commits:** `ce01c18` (introduces `_boxes_to_density`), `a1e9996` (center-pixel sampling), `74e9307` (full-box mode)
+
+**What:** In YOLO-only mode (`--detector` set, no `--lwcc-model`), the density map `rho_np` is synthesized from bounding boxes via `_boxes_to_density`. Three sub-iterations:
+
+**v1 (ce01c18) — full-box fill:** Each person box fills its entire pixel region with `+1.0`. Overlapping boxes accumulate.
+
+**v2 (a1e9996) — center-pixel radius:** Changed to stamp only a small patch of radius `center_radius` (default 1, meaning a 3×3 patch) around each box center. The box center is a more reliable indicator of where a person's center of mass is than the box boundary. Full-box fill was inflating `Var(u)` at box edges where different persons' bounding boxes met but had different flow vectors — the overlap region had artificially high variance.
+
+**v3 (74e9307) — full-box as explicit option:** Added `--center-radius -1` to re-enable full-box mode explicitly. The `-1` sentinel gives users the choice: center-patch (default, recommended for density accuracy) vs. full-box (better for visualization, less sensitive to occlusion).
+
+**Why center-pixel worked better:** At the flow-grid resolution (H/8 of the inference frame), a center-radius=1 patch is 3×3 cells. Each cell is ~8×8 source pixels. A person's bounding box at typical distance spans 10–30 grid cells — most of which are clothing, limbs, or partial occlusion by other people. Stamping only the center avoids polluting the density map with the noisy box periphery, so `sum(rho) ≈ N` is maintained without artificially high density at box overlaps.
+
+**Why full-box sometimes fails:** When the crowd is very dense, boxes overlap heavily. Filling the full box gives `rho >> N` in overlap regions (everyone stacked on top of everyone), which makes those regions look extremely dangerous even if the flow there is uniform (no velocity variance → no real crush pressure). The center-pixel mode avoids this accumulation artifact.
+
+---
+
+### Exp 10: Revised pressure formula — dual-term P = α·density + β·speed
+
+**Date:** 2026-05-01  
+**Commit:** `00171c9` — *updated pressure formula to include static dense and fast moving crowd*  
+**File:** `fluid-flow-pinn/infer.py` — `_compute_pressure_np()`
+
+**What:** Replaced the old `P = ρ^α · Var(u)` pressure formula with:
+
+```
+P = α · (ρ / ρ_max) + β · (|u| / |u|_max)
+```
+
+Both terms are normalised to `[0, 1]` per frame before weighting. `p_alpha` (default 1.0) and `p_beta` (default 1.0) are the CLI-configurable weights.
+
+The Var(u) panel in the dashboard was also replaced with the `|u|` speed magnitude heatmap to match the new formula.
+
+**Why the old formula `ρ^α · Var(u)` was replaced:**
+
+The old formula only signals high pressure when *both* density is high *and* flow is disordered. This misses two dangerous crowd scenarios:
+
+1. **Static dense crush:** density is very high but `Var(u) ≈ 0` because everyone is pressed together and barely moving. Old formula → near-zero pressure. New formula → α·(ρ/ρ_max) fires strongly.
+
+2. **Fast-moving stampede:** `|u|` is large but density may be moderate (people starting to run, crowd thinning). Old formula underweights speed-based danger. New formula → β·(|u|/|u|_max) fires.
+
+**Why normalisation per frame:** Absolute values of ρ and |u| vary enormously between scenes (indoor vs. outdoor, zoom level, camera height). Normalising to [0,1] per frame makes α and β directly comparable as fractional weights regardless of scene — you can set `α=0.7, β=0.3` and always know the density term contributes 70% of the maximum possible pressure reading.
+
+**Trade-off:** Per-frame normalisation means the *absolute* pressure value is meaningless — it's always in [0, 2]. This makes it harder to use a fixed threshold across frames. For alarms, you need a temporal trend (is P rising over the last 30 frames?) rather than a fixed absolute cutoff. This is acceptable because absolute thresholds on the old formula were also unreliable — see the "every frame fires ALARM" problem from Step 9.
+
+**What didn't work before this:** The `--per-capita`, `--rho-alpha` CLI flags were the previous attempt to tune the formula. They were kept around but became secondary to the new two-term formula. The root issue was not the coupling exponent but the wrong functional form — the original formula has no way to distinguish a "static crush" (dangerous) from a "static sparse crowd" (safe) because both have low `Var(u)`.
+
+---
+
+### Exp 11: Center-pixel velocity sampling
+
+**Date:** 2026-05-01  
+**Commit:** `a1e9996` — *add center pixel for more accurate velocity*  
+**File:** `fluid-flow-pinn/infer.py` — `_yolo_person_mask()`, `_boxes_to_density()`
+
+*(Detailed mechanics are in Exp 9 above; this entry focuses on the velocity measurement reasoning.)*
+
+**Why center-pixel matters for velocity:** RAFT flow vectors are estimated over a local patch around each pixel. At box boundaries — especially where two people's boxes overlap — the RAFT estimate is a mixture of motion from both people, which inflates `Var(u)` artificially. Measuring flow only at the body center avoids this mixing artefact and gives a cleaner per-person velocity estimate.
+
+**The radius=1 choice:** A 3×3 patch (radius 1 in grid cells) covers ~24×24 source pixels. Large enough to average out pixel-level RAFT noise; small enough to stay well within the person's torso. Radius=0 (single grid cell) was too noisy. Radius=2 (5×5, 40×40 px) started including arm and shoulder regions which move differently from the torso.
+
+---
+
+### Exp 12: Full-box mask mode (center_radius = -1)
+
+**Date:** 2026-05-01  
+**Commit:** `74e9307` — *add option to pass full box*  
+**File:** `fluid-flow-pinn/infer.py` — `_yolo_person_mask()`, `_boxes_to_density()`
+
+**What:** Added `center_radius = -1` as a sentinel to re-enable full bounding-box fill in both the mask and the density functions. When `-1` is passed, the functions fill the entire YOLO box region instead of the center patch. Exposed via `--center-radius -1` CLI.
+
+**Why keep it as an option:** Full-box mode is better for the visualisation use case (boxes appear clearly in the density heatmap) and for sparsely-packed crowds where individual boxes rarely overlap. It also preserves a well-defined region for computing flow statistics when people are far apart and the center-pixel approach might miss part of their motion.
+
+**When to use which:**
+- `center_radius ≥ 0` (default=1): recommended for dense crowds, accurate density, clean pressure map
+- `center_radius = -1` (full box): better for sparse crowds or debugging/visualisation where you want to see the full box region in the heatmap
+
+---
+
+## 8. Datasets  <!-- was §7 -->
 
 | Dataset | Role | Split | Status |
 |---|---|---|---|
@@ -673,7 +902,7 @@ FDST Dataset/
 
 ---
 
-## 8. Design Decisions Log
+## 9. Design Decisions Log  <!-- was §8 -->
 
 | Decision | Alternative considered | Why we chose this |
 |---|---|---|
@@ -711,7 +940,7 @@ FDST Dataset/
 
 ---
 
-## 9. Open Questions
+## 10. Open Questions  <!-- was §9 -->
 
 - [ ] Will the continuity residual `R` be meaningful at 1/8 resolution, or does downsampling smooth out the local compression signal?
 - [ ] UMN is 30fps at 320×240 — after bicubic upsample to 640×480, will RAFT produce usable flow vectors or will the upsampled frames introduce artifacts?
