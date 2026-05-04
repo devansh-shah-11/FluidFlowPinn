@@ -50,10 +50,13 @@ def _overlay_heatmap(
     # the background with JET's blue floor.
     w = (d ** 0.5)[..., None] * alpha
     vis = (bgr.astype(np.float32) * (1.0 - w) + heat.astype(np.float32) * w).astype(np.uint8)
-    if tau > 0.0:
-        mask = (density > tau).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(vis, contours, -1, (255, 255, 255), 1)
+    # Outline detected regions in bold red. If --tau is given, threshold on the
+    # raw density (matches infer.py semantics); otherwise threshold on the
+    # normalized map at 3% of peak so the outlines work for any density scale.
+    thresh = (density > tau) if tau > 0.0 else (d > 0.03)
+    mask = thresh.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(vis, contours, -1, (0, 0, 255), 2)
     return vis
 
 
