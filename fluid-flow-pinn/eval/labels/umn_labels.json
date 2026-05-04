@@ -1,0 +1,17 @@
+{
+  "_doc": "Per-scene panic-onset frame indices for the UMN crowd-anomaly dataset (Mehran et al. 2009). Frames before onset are normal (label=0), onset and beyond are anomalous (label=1). The numbers below are the canonical values widely cited in the social-force / sparse-reconstruction baselines; if your local split differs, edit them.",
+  "_columns": "scene_name -> {onset_frame, end_frame}; end_frame is exclusive. Set end_frame to -1 to mean 'until end of clip'.",
+  "scenes": {
+    "scene1":  {"onset_frame":  486, "end_frame": -1},
+    "scene2":  {"onset_frame":  299, "end_frame": -1},
+    "scene3":  {"onset_frame":  244, "end_frame": -1},
+    "scene4":  {"onset_frame":  450, "end_frame": -1},
+    "scene5":  {"onset_frame":  416, "end_frame": -1},
+    "scene6":  {"onset_frame":  348, "end_frame": -1},
+    "scene7":  {"onset_frame":  434, "end_frame": -1},
+    "scene8":  {"onset_frame":  338, "end_frame": -1},
+    "scene9":  {"onset_frame":  444, "end_frame": -1},
+    "scene10": {"onset_frame":  376, "end_frame": -1},
+    "scene11": {"onset_frame":  448, "end_frame": -1}
+  }
+}

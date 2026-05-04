@@ -1,45 +1,36 @@
-"""Evaluation script — run on FDST test split (and optionally ShanghaiTech/CrowdFlow later).
+"""Component-validation evaluator for the inference pipeline.
 
-Usage:
-    # Quantitative metrics on FDST test split
-    python evaluate.py --checkpoint checkpoints/best.pt --fdst-path /scratch/dns5508/FDST_Data/
+The project no longer trains an end-to-end PINN; the per-frame compute lives in
+`pipeline.Pipeline`. This script validates the *components* against benchmarks
+that already have ground truth:
 
-    # + save visualizations for the first N batches
-    python evaluate.py \
-    --checkpoint /scratch/dns5508/FluidFlowPinn/checkpoints/best.pt \
-    --fdst-path /scratch/dns5508/FDST_Data/ \
-    --vis-dir /scratch/dns5508/FluidFlowPinn/outputs/vis/ \
-    --vis-batches 5
+    --component density   FDST test split (per-frame head count) using lwcc.
+                          Reports count MAE / RMSE / MAPE.
+    --component count     YOLO-only count vs FDST GT (no lwcc).
+    --component flow      CrowdFlow synthetic GT flow EPE for the RAFT branch.
 
-    python evaluate.py \
-    --checkpoint /scratch/dns5508/FluidFlowPinn/checkpoints/best.pt \
-    --fdst-path /scratch/dns5508/FDST_Data/ \
-    --timeline \
-    --timeline-scene 10 \
-    --vis-dir /scratch/dns5508/FluidFlowPinn/outputs/vis/
+Block B (anomaly detection on UMN/UCSD) lives under `eval/run_anomaly.py`.
 
-
-    python evaluate.py --checkpoint checkpoints/best.pt --fdst-path /scratch/.../FDST_Data/ --vis-dir outputs/vis/ --vis-batches 5
-
-    # Pressure timeline on a single scene folder (anomaly detection demo)
-    python evaluate.py --checkpoint checkpoints/best.pt --fdst-path /scratch/.../FDST_Data/ --timeline --timeline-scene 10
+Examples:
+    python evaluate.py --component density --fdst-path /scratch/dns5508/FDST_Data/ \\
+                       --lwcc-model DM-Count
+    python evaluate.py --component count   --fdst-path /scratch/dns5508/FDST_Data/ \\
+                       --detector yolo26n.pt
+    python evaluate.py --component flow    --crowdflow-path /scratch/.../CrowdFlow/
 """
 
 from __future__ import annotations
-
-import matplotlib
-matplotlib.use("Agg")  # no display available in SLURM — must be set before any other matplotlib import
 
 import argparse
 import logging
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import cv2
+import numpy as np
 import torch
-import yaml
-from torch.amp import autocast
-from torch.utils.data import DataLoader
-from torchvision import transforms as T
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,249 +40,178 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
+# ── Density / count on FDST ─────────────────────────────────────────────────
 
-def _compute_metrics(
-    pred_counts: list[float],
-    gt_counts: list[float],
-) -> dict[str, float]:
-    import numpy as np
-    p = np.array(pred_counts)
-    g = np.array(gt_counts)
-    mae  = float(np.abs(p - g).mean())
-    mse  = float(np.sqrt(((p - g) ** 2).mean()))
-    # Mean Absolute Percentage Error (guard against zero GT)
-    mape_mask = g > 0
-    mape = float(np.abs((p[mape_mask] - g[mape_mask]) / g[mape_mask]).mean() * 100) if mape_mask.any() else float("nan")
-    return {"MAE": mae, "RMSE": mse, "MAPE%": mape}
-
-
-# ── Single-scene pressure timeline ────────────────────────────────────────────
-
-@torch.no_grad()
-def _pressure_timeline(
-    model,
-    scene_dir: Path,
-    device: torch.device,
-    fps: float,
-    threshold: float,
-    use_fp16: bool,
-    save_path: Path | None,
-) -> None:
-    import cv2
-    from utils.visualize import plot_pressure_timeline
-
-    frame_files = sorted(scene_dir.glob("*.jpg"), key=lambda p: p.stem)
-    if len(frame_files) < 2:
-        log.error("Scene %s has fewer than 2 frames.", scene_dir)
-        return
-
-    _MEAN = [0.485, 0.456, 0.406]
-    _STD  = [0.229, 0.224, 0.225]
-    xform = T.Compose([T.ToTensor(), T.Normalize(mean=_MEAN, std=_STD)])
-
-    def _load(path):
-        img = cv2.imread(str(path))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return xform(img).unsqueeze(0).to(device)
-
-    model.eval()
-    scores = []
-    for i in range(len(frame_files) - 1):
-        ft  = _load(frame_files[i])
-        ft1 = _load(frame_files[i + 1])
-        with autocast(device_type=device.type, enabled=use_fp16):
-            out = model(ft, ft1)
-        p_max = out["P"].max().item()
-        scores.append(p_max)
-        if (i + 1) % 50 == 0:
-            log.info("  frame %d / %d  max_P=%.4f", i + 1, len(frame_files) - 1, p_max)
-
-    fig = plot_pressure_timeline(
-        scores, fps=fps, threshold=threshold, save_path=save_path
-    )
-    log.info("Pressure timeline: %d frames, max=%.4f, mean=%.4f",
-             len(scores), max(scores), sum(scores) / len(scores))
-    if save_path:
-        log.info("Saved timeline → %s", save_path)
-    else:
-        log.info("No --vis-dir specified; timeline not saved.")
-
-
-# ── Main evaluation loop ───────────────────────────────────────────────────────
-
-@torch.no_grad()
-def evaluate(args: argparse.Namespace) -> None:
-    # ── Load checkpoint ───────────────────────────────────────────────────────
-    ckpt_path = Path(args.checkpoint)
-    if not ckpt_path.exists():
-        log.error("Checkpoint not found: %s", ckpt_path)
-        sys.exit(1)
-
-    log.info("Loading checkpoint: %s", ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    cfg  = ckpt.get("config", {})
-
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_fp16 = cfg.get("model", {}).get("use_fp16", True) and device.type == "cuda"
-    log.info("Device: %s  FP16: %s", device, use_fp16)
-
-    # ── Build model ───────────────────────────────────────────────────────────
-    repo_root = Path(__file__).parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
-    from models.pinn import FluidFlowPINN
-    model = FluidFlowPINN(
-        use_grad_checkpoint=False,   # not needed for inference
-        raft_frozen=True,
-        pressure_window=cfg.get("model", {}).get("pressure_window", 5),
-    ).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    log.info("Model loaded (epoch %d, val_loss=%.4f)",
-             ckpt.get("epoch", -1), ckpt.get("val_loss", float("nan")))
-
-    fps       = float(cfg.get("preprocessing", {}).get("fps", 30))
-    threshold = float(args.threshold)
-
-    # ── Pressure timeline mode ────────────────────────────────────────────────
-    if args.timeline:
-        from preprocessing.dataset_loader import FDSTDataset
-        fdst_root = Path(args.fdst_path)
-        test_dir  = fdst_root / "test_data"
-        if not test_dir.exists():
-            test_dir = fdst_root / "test"
-
-        scene_name = str(args.timeline_scene)
-        scene_dir  = test_dir / scene_name
-        if not scene_dir.exists():
-            # list available scenes
-            available = [d.name for d in sorted(test_dir.iterdir()) if d.is_dir()]
-            log.error("Scene '%s' not found. Available: %s", scene_name, available)
-            sys.exit(1)
-
-        save_path = Path(args.vis_dir) / f"timeline_scene{scene_name}.png" if args.vis_dir else None
-        _pressure_timeline(model, scene_dir, device, fps, threshold, use_fp16, save_path)
-        return
-
-    # ── Quantitative evaluation on FDST test split ────────────────────────────
+def _eval_fdst(args: argparse.Namespace) -> None:
+    """Iterate FDST test split, run Pipeline on each frame pair, report count MAE."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from pipeline import Pipeline, default_pipeline_args
     from preprocessing.dataset_loader import FDSTDataset
-
-    target_h = cfg.get("preprocessing", {}).get("target_height", 720)
-    target_w = cfg.get("preprocessing", {}).get("target_width",  1280)
-    _MEAN = [0.485, 0.456, 0.406]
-    _STD  = [0.229, 0.224, 0.225]
-    xform = T.Compose([T.ToTensor(), T.Normalize(mean=_MEAN, std=_STD)])
+    from torch.utils.data import DataLoader
+    from torchvision import transforms as T
+    from utils.metrics import count_mae, count_mape, count_rmse
 
     fdst_root = Path(args.fdst_path)
-    dataset   = FDSTDataset(root=fdst_root, split="test", transform=xform)
+    _MEAN = [0.485, 0.456, 0.406]; _STD = [0.229, 0.224, 0.225]
+    xform = T.Compose([T.ToTensor(), T.Normalize(mean=_MEAN, std=_STD)])
+    dataset = FDSTDataset(root=fdst_root, split="test", transform=xform)
 
-    # Filter to target resolution (both frames)
-    import cv2
+    log.info("FDST test set: %d samples", len(dataset))
 
-    def _res_ok(path):
-        img = cv2.imread(path)
-        return img is not None and img.shape[:2] == (target_h, target_w)
-
-    n_before = len(dataset._samples)
-    dataset._samples = [s for s in dataset._samples
-                        if _res_ok(s["frame_t"]) and _res_ok(s["frame_t1"])]
-    # Rebuild scene_ranges
-    dataset.scene_ranges = {}
-    for i, s in enumerate(dataset._samples):
-        sc = s["scene"]
-        if sc not in dataset.scene_ranges:
-            dataset.scene_ranges[sc] = (i, i)
-        dataset.scene_ranges[sc] = (dataset.scene_ranges[sc][0], i + 1)
-    log.info("Test set: %d / %d samples at %dx%d", len(dataset), n_before, target_h, target_w)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
+    pipe_args = default_pipeline_args(
+        lwcc_model=args.lwcc_model if args.component == "density" else None,
+        lwcc_weights=args.lwcc_weights,
+        detector=args.detector if args.component == "count" else None,
+        detector_conf=args.detector_conf,
+        center_radius=args.center_radius,
+        # Pure-component mode: don't gate by mask; we want raw rho counts.
+        density_mask_tau=0.0,
     )
+    pipe = Pipeline(pipe_args)
 
-    pred_counts, gt_counts = [], []
-    pressure_maxes = []
-    vis_saved = 0
+    pred_counts: list[float] = []
+    gt_counts:   list[float] = []
 
-    vis_dir = Path(args.vis_dir) if args.vis_dir else None
-    if vis_dir:
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        from utils.visualize import visualize_batch
+    # Directly iterate underlying samples so we can read frame_t as a BGR image
+    # for the pipeline (which expects BGR np.ndarray, not the normalised tensor).
+    for i, sample in enumerate(dataset._samples):
+        bgr = cv2.imread(sample["frame_t"])
+        if bgr is None:
+            continue
+        # Need a "previous" frame for the pipeline, but for density we only
+        # need rho — feed the same frame twice (u will be ~0, ignored).
+        _ = pipe.process(bgr)            # primes prev_tensor
+        out = pipe.process(bgr)          # rho available now
+        rho = out["rho"]
+        if rho is None:
+            continue
+        pred_counts.append(float(rho.sum()))
 
-    for batch_idx, batch in enumerate(loader):
-        ft  = batch["frame_t"].to(device, non_blocking=True)
-        ft1 = batch["frame_t1"].to(device, non_blocking=True)
-        gt  = batch["density_map"].sum(dim=(1, 2, 3)).to(device)
+        # GT: density map shipped by FDSTDataset integrates to head count.
+        item = dataset[i]
+        gt_counts.append(float(item["density_map"].sum().item()))
+        # Reset prev_tensor so each sample is independent.
+        pipe.prev_tensor = None
+        pipe.u_ema = None
 
-        with autocast(device_type=device.type, enabled=use_fp16):
-            out = model(ft, ft1)
+        if (i + 1) % 50 == 0:
+            log.info("  %d / %d", i + 1, len(dataset._samples))
 
-        pred = out["rho"].sum(dim=(1, 2, 3))
-        pred_counts.extend(pred.cpu().tolist())
-        gt_counts.extend(gt.cpu().tolist())
-        pressure_maxes.extend(out["P"].amax(dim=(1, 2, 3)).cpu().tolist())
+    pipe.close()
 
-        # Save visualizations for the first --vis-batches batches
-        if vis_dir and vis_saved < args.vis_batches:
-            figs = visualize_batch(
-                frames=ft.cpu(),
-                rhos=out["rho"].cpu(),
-                us=out["u"].cpu(),
-                Ps=out["P"].cpu(),
-                gt_densities=batch["density_map"],
-                save_dir=vis_dir,
-                prefix=f"batch{batch_idx:04d}",
-            )
-            import matplotlib.pyplot as plt
-            for fig in figs:
-                plt.close(fig)
-            vis_saved += 1
-            log.info("Saved visualizations for batch %d → %s", batch_idx, vis_dir)
-
-        if (batch_idx + 1) % 20 == 0:
-            log.info("  batch %d / %d", batch_idx + 1, len(loader))
-
-    # ── Print metrics ─────────────────────────────────────────────────────────
-    metrics = _compute_metrics(pred_counts, gt_counts)
-    log.info("─" * 50)
-    log.info("FDST test  |  MAE=%.2f  RMSE=%.2f  MAPE=%.1f%%",
-             metrics["MAE"], metrics["RMSE"], metrics["MAPE%"])
-    log.info("Pressure   |  mean_max=%.4f  overall_max=%.4f",
-             sum(pressure_maxes) / len(pressure_maxes), max(pressure_maxes))
-    log.info("─" * 50)
-
-    # Also save a summary timeline of max pressure across the whole test set
-    if vis_dir:
-        from utils.visualize import plot_pressure_timeline
-        import matplotlib.pyplot as plt
-        fig = plot_pressure_timeline(
-            pressure_maxes,
-            fps=fps,
-            threshold=threshold,
-            save_path=vis_dir / "pressure_timeline_testset.png",
-        )
-        plt.close(fig)
-        log.info("Saved pressure timeline → %s", vis_dir / "pressure_timeline_testset.png")
+    log.info("─" * 56)
+    log.info("FDST  |  MAE=%.2f  RMSE=%.2f  MAPE=%.1f%%  (n=%d)",
+             count_mae(pred_counts, gt_counts),
+             count_rmse(pred_counts, gt_counts),
+             count_mape(pred_counts, gt_counts),
+             len(pred_counts))
+    log.info("─" * 56)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Flow EPE on CrowdFlow ───────────────────────────────────────────────────
+
+def _eval_crowdflow(args: argparse.Namespace) -> None:
+    """Run RAFT on CrowdFlow sequences and compare to GT optical flow."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from pipeline import Pipeline, default_pipeline_args
+    from utils.metrics import flow_epe
+
+    cf_root = Path(args.crowdflow_path)
+    if not cf_root.exists():
+        log.error("CrowdFlow path not found: %s", cf_root)
+        sys.exit(1)
+
+    # CrowdFlow layout: <root>/IM01/frame_*.png + <root>/IM01_gt/flow_*.flo
+    # We accept any layout: walk for paired (frame_t, frame_t+1, flow.flo).
+    pairs = _discover_crowdflow_pairs(cf_root)
+    if not pairs:
+        log.error("No (frame, frame+1, flow.flo) triples found under %s", cf_root)
+        sys.exit(1)
+    log.info("CrowdFlow: %d frame pairs with GT flow", len(pairs))
+
+    pipe_args = default_pipeline_args()  # plain RAFT, no density
+    pipe = Pipeline(pipe_args)
+
+    epes: list[float] = []
+    for i, (f0, f1, flo) in enumerate(pairs):
+        bgr0 = cv2.imread(str(f0)); bgr1 = cv2.imread(str(f1))
+        if bgr0 is None or bgr1 is None:
+            continue
+        # Resize to multiples of 8 for RAFT
+        h, w = bgr0.shape[:2]; h8 = (h // 8) * 8; w8 = (w // 8) * 8
+        bgr0 = cv2.resize(bgr0, (w8, h8)); bgr1 = cv2.resize(bgr1, (w8, h8))
+        pipe.prev_tensor = None; pipe.u_ema = None
+        _ = pipe.process(bgr0); out = pipe.process(bgr1)
+        u_pred = out["u"]  # (2, h8/8, w8/8) — grid units
+        if u_pred is None:
+            continue
+        gt = _read_flo(flo)  # (2, H, W) in pixel units
+        # Upsample prediction from H/8 grid to GT resolution and convert to pixels.
+        Hp, Wp = gt.shape[1], gt.shape[2]
+        u_up = np.stack([
+            cv2.resize(u_pred[0], (Wp, Hp), interpolation=cv2.INTER_LINEAR) * 8.0,
+            cv2.resize(u_pred[1], (Wp, Hp), interpolation=cv2.INTER_LINEAR) * 8.0,
+        ], axis=0)
+        epes.append(flow_epe(u_up, gt))
+        if (i + 1) % 20 == 0:
+            log.info("  %d / %d  EPE=%.3f", i + 1, len(pairs), float(np.mean(epes)))
+
+    pipe.close()
+    log.info("─" * 56)
+    log.info("CrowdFlow  |  mean EPE = %.3f px  (n=%d)", float(np.mean(epes)), len(epes))
+    log.info("─" * 56)
+
+
+def _discover_crowdflow_pairs(root: Path) -> list[tuple[Path, Path, Path]]:
+    """Best-effort scan for (frame_t, frame_t+1, flow.flo) triples.
+
+    Tolerates a few common layouts because CrowdFlow distributions vary.
+    """
+    pairs: list[tuple[Path, Path, Path]] = []
+    seqs = [d for d in sorted(root.iterdir()) if d.is_dir()]
+    for seq in seqs:
+        frames = sorted([p for p in seq.glob("*.png")] + [p for p in seq.glob("*.jpg")])
+        flo_dir = seq.parent / f"{seq.name}_gt"
+        if not flo_dir.exists():
+            flo_dir = seq / "flow"
+        if not flo_dir.exists():
+            continue
+        flos = sorted(flo_dir.glob("*.flo"))
+        if len(frames) < 2 or len(flos) == 0:
+            continue
+        for i, flo in enumerate(flos):
+            if i + 1 >= len(frames):
+                break
+            pairs.append((frames[i], frames[i + 1], flo))
+    return pairs
+
+
+def _read_flo(path: Path) -> np.ndarray:
+    """Middlebury .flo reader. Returns (2, H, W) float32 (u, v) in pixels."""
+    with open(path, "rb") as f:
+        magic = np.fromfile(f, np.float32, count=1)
+        if magic[0] != 202021.25:
+            raise IOError(f"Not a .flo file: {path}")
+        w = int(np.fromfile(f, np.int32, count=1)[0])
+        h = int(np.fromfile(f, np.int32, count=1)[0])
+        data = np.fromfile(f, np.float32, count=2 * w * h).reshape(h, w, 2)
+    return data.transpose(2, 0, 1).astype(np.float32)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate fluid-flow PINN")
-    p.add_argument("--checkpoint",      required=True,         help="Path to .pt checkpoint (best.pt)")
-    p.add_argument("--fdst-path",       required=True,         help="Path to FDST dataset root")
-    p.add_argument("--batch-size",      type=int, default=4,   help="Eval batch size")
-    p.add_argument("--threshold",       type=float, default=0.5, help="Pressure alert threshold")
-    p.add_argument("--vis-dir",         default=None,          help="Directory to save visualizations")
-    p.add_argument("--vis-batches",     type=int, default=5,   help="Number of batches to visualize")
-    p.add_argument("--timeline",        action="store_true",   help="Run pressure timeline on a single scene")
-    p.add_argument("--timeline-scene",  default="10",          help="Scene folder name for --timeline mode")
+    p = argparse.ArgumentParser(description="Component validation for the inference pipeline")
+    p.add_argument("--component", choices=("density", "count", "flow"), required=True,
+                   help="density: lwcc on FDST. count: YOLO on FDST. flow: RAFT on CrowdFlow.")
+    p.add_argument("--fdst-path", default=None, help="FDST root (for density/count modes)")
+    p.add_argument("--crowdflow-path", default=None, help="CrowdFlow root (for flow mode)")
+    p.add_argument("--lwcc-model", default="DM-Count")
+    p.add_argument("--lwcc-weights", default="SHA")
+    p.add_argument("--detector", default="yolo26n.pt")
+    p.add_argument("--detector-conf", type=float, default=0.25)
+    p.add_argument("--center-radius", type=int, default=-1,
+                   help="For count mode, default to full bbox so density sums to N people.")
     return p.parse_args()
 
 
@@ -299,4 +219,13 @@ if __name__ == "__main__":
     args = _parse_args()
     import os
     os.chdir(Path(__file__).parent)
-    evaluate(args)
+    if args.component in ("density", "count"):
+        if not args.fdst_path:
+            log.error("--fdst-path required for component=%s", args.component)
+            sys.exit(2)
+        _eval_fdst(args)
+    elif args.component == "flow":
+        if not args.crowdflow_path:
+            log.error("--crowdflow-path required for component=flow")
+            sys.exit(2)
+        _eval_crowdflow(args)

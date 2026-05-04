@@ -612,7 +612,7 @@ def _flow_arrows(
         for x in range(step // 2, w, step):
             dx, dy = float(ux[y, x]), float(uy[y, x])
             mag = (dx * dx + dy * dy) ** 0.5
-            if mag < 1.0:
+            if mag < 0.5:
                 continue
             cv2.arrowedLine(out, (x, y),
                             (int(x + dx), int(y + dy)),
@@ -735,11 +735,12 @@ def _build_dashboard(
             var_pane = fr.copy()
             _label(var_pane, "angVar  (need 2 frames)")
 
-        # Row 3 — full-width flow arrows on a clean copy of the frame so
-        # arrows are visible without a heatmap competing for attention.
+        # Row 3 — full-width flow arrows on a clean copy of the frame.
+        # Use unmasked u_np so arrows appear wherever RAFT detects motion,
+        # not just at the tiny YOLO center patches used for pressure computation.
         full_w = pane_w * 2  # match the two-column width above
         fr_wide = cv2.resize(frame_bgr, (full_w, pane_h))
-        arrows_pane = _flow_arrows(fr_wide, u_vis, step=32, scale=1.0)
+        arrows_pane = _flow_arrows(fr_wide, u_np, step=32, scale=1.0)
         _label(arrows_pane, "flow arrows (RAFT)")
     else:
         u_pane = fr.copy();    _label(u_pane,    "|u|  (need 2 frames)")
@@ -791,24 +792,19 @@ def _build_dashboard(
 
 @torch.no_grad()
 def run(args: argparse.Namespace) -> None:
+    from pipeline import Pipeline
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Using device: %s", device)
-    ckpt = Path(args.checkpoint) if args.checkpoint else None
-    raft_w = Path(args.raft_weights) if args.raft_weights else None
-    model, cfg, use_fp16 = _load_model(ckpt, device, raft_iters=args.raft_iters,
-                                        raft_weights=raft_w, raft_variant=args.raft_variant)
 
-    # Apply --no-lwcc override before loading
     if args.no_lwcc:
         args.lwcc_model = None
-
-    # lwcc is the density source — load once, reuse every frame (None if disabled)
-    lwcc_model, lwcc_get_count, lwcc_tmp = _load_lwcc(args.lwcc_model, args.lwcc_weights, device)
-
-    # optional YOLO detector — supplies head_mask and (when lwcc absent) synthetic rho
-    yolo_model = _load_yolo(args.detector, device) if args.detector else None
-    if yolo_model is not None and args.density_mask_tau != 0.01:
+    if args.detector and args.density_mask_tau != 0.01:
         log.warning("--detector is active; --density-mask-tau is ignored.")
+
+    pipe = Pipeline(args, device=device)
+    lwcc_model = pipe.lwcc_model
+    yolo_model = pipe.yolo_model
 
     if lwcc_model is None and yolo_model is None:
         log.warning(
@@ -860,9 +856,9 @@ def run(args: argparse.Namespace) -> None:
         target_hw = (inf_h // 8, inf_w // 8)
         if lwcc_model is not None:
             rho_np = _lwcc_density_np(
-                frame_resized, lwcc_model, lwcc_get_count,
+                frame_resized, lwcc_model, pipe.lwcc_get_count,
                 args.lwcc_model, target_hw=target_hw,
-                tmp_path=lwcc_tmp,
+                tmp_path=pipe.lwcc_tmp,
             )
         elif yolo_model is not None:
             _, boxes_img = _yolo_person_mask(
@@ -887,9 +883,7 @@ def run(args: argparse.Namespace) -> None:
 
     # ── Video / webcam path ────────────────────────────────────────────────
     writer: Optional[cv2.VideoWriter] = None
-    prev_tensor: Optional[torch.Tensor] = None
     prev_resized: Optional[np.ndarray] = None
-    u_ema: Optional[np.ndarray] = None
     frame_idx = 0
     last_t = time.time()
     fps_actual = 0.0
@@ -900,91 +894,19 @@ def run(args: argparse.Namespace) -> None:
             if frame is None:
                 break
             frame_resized = cv2.resize(frame, (inf_w, inf_h))
-            cur_tensor = _bgr_to_tensor(frame_resized, device)
 
-            rho_np:     Optional[np.ndarray] = None
-            u_np:       Optional[np.ndarray] = None
-            P_np:       Optional[np.ndarray] = None
-            ang_var_np: Optional[np.ndarray] = None
-            p_max:      Optional[float] = None
-            head_mask:  Optional[np.ndarray] = None
-            yolo_boxes: Optional[np.ndarray] = None
+            res = pipe.process(frame_resized)
+            rho_np     = res["rho"]
+            u_np       = res["u"]
+            P_np       = res["P"]
+            p_max      = res["p_max"]
+            ang_var_np = res["ang_var"]
+            head_mask  = res["head_mask"]
+            yolo_boxes = res["yolo_boxes"]
 
-            if prev_tensor is not None:
-                with autocast(device_type=device.type, enabled=use_fp16):
-                    u_t = model(prev_tensor, cur_tensor)
-                u_np = u_t.squeeze(0).detach().float().cpu().numpy()  # (2, H', W')
-
-                target_hw = (u_np.shape[1], u_np.shape[2])
-
-                # ── Density source selection ─────────────────────────────────
-                if yolo_model is not None:
-                    head_mask, yolo_boxes = _yolo_person_mask(
-                        frame_resized, yolo_model,
-                        target_hw=target_hw,
-                        conf=args.detector_conf,
-                        center_radius=args.center_radius,
-                    )
-                    if lwcc_model is not None:
-                        # Both active: lwcc is authoritative rho; YOLO supplies head_mask.
-                        rho_np = _lwcc_density_np(
-                            frame_resized, lwcc_model, lwcc_get_count,
-                            args.lwcc_model, target_hw=target_hw,
-                            tmp_path=lwcc_tmp,
-                        )
-                    else:
-                        # YOLO-only: synthesize rho from bounding boxes.
-                        rho_np = _boxes_to_density(
-                            yolo_boxes, frame_resized.shape[:2], target_hw,
-                            center_radius=args.center_radius,
-                        )
-                elif lwcc_model is not None:
-                    # Original lwcc-only path.
-                    rho_np = _lwcc_density_np(
-                        frame_resized, lwcc_model, lwcc_get_count,
-                        args.lwcc_model, target_hw=target_hw,
-                        tmp_path=lwcc_tmp,
-                    )
-                    head_mask = _head_mask(rho_np, args.density_mask_tau) if args.density_mask_tau > 0.0 else None
-                else:
-                    # No density source: pure flow mode.
-                    rho_np = None
-                    head_mask = None
-
-                # Smooth u to suppress RAFT noise without introducing edges.
-                # Spatial Gaussian first, then temporal EMA across frames.
-                u_np = _denoise_flow(u_np, spatial_sigma=args.flow_spatial_sigma)
-                u_np = _temporal_ema(u_ema, u_np, alpha=args.flow_ema_alpha)
-                u_ema = u_np  # carry forward for next frame
-
-                P_np = _compute_pressure_np(
-                    rho_np, u_np,
-                    p_alpha=args.p_alpha,
-                    p_beta=args.p_beta,
-                    p_gamma=args.p_gamma,
-                    mask=head_mask,
-                    var_kernel=args.var_kernel,
-                )
-
-                # Compute angular variance for visualization regardless of p_gamma
-                # so the panel is always shown when flow is available.
-                _m_vis: Optional[np.ndarray] = None
-                if head_mask is not None:
-                    mh, mw = u_np.shape[1], u_np.shape[2]
-                    _m_vis = head_mask if head_mask.shape == (mh, mw) else cv2.resize(
-                        head_mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
-                ang_var_np: Optional[np.ndarray] = _local_angular_var_np(
-                    u_np * (_m_vis[np.newaxis] if _m_vis is not None else 1.0),
-                    k=args.var_kernel, person_mask=_m_vis,
-                )
-
-                p_max = _aggregate_pressure(
-                    P_np, rho_np, mode=args.p_agg, topk_frac=args.topk_frac,
-                )
+            if p_max is not None:
                 history.append(p_max)
                 all_scores.append(p_max)
-            # On the first frame we have no pair yet — render the dashboard
-            # using the current frame and skip ρ/P.
 
             now = time.time()
             dt = now - last_t
@@ -1023,7 +945,6 @@ def run(args: argparse.Namespace) -> None:
                 log.info("  frame %5d | maxP=%.4f | fps=%.2f",
                          frame_idx + 1, p_max, fps_actual)
 
-            prev_tensor = cur_tensor
             prev_resized = frame_resized
             frame_idx += 1
 
@@ -1033,8 +954,7 @@ def run(args: argparse.Namespace) -> None:
             writer.release()
         if args.display:
             cv2.destroyAllWindows()
-        if lwcc_tmp is not None:
-            Path(lwcc_tmp).unlink(missing_ok=True)
+        pipe.close()
 
     # ── Final timeline png ───────────────────────────────────────────────
     if out_dir and all_scores:
