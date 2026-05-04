@@ -669,14 +669,15 @@ def _build_dashboard(
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
-    Layout (3 rows × 2 cols):
+    Layout (4 rows, mixed cols):
         ┌──────────┬──────────┐
-        │   input  │ rho      │
+        │   input  │   rho    │
         ├──────────┼──────────┤
-        │  |u| +   │ angVar   │
-        │  arrows  │          │
-        ├──────────┼──────────┤
-        │   P      │ status   │
+        │   |u|    │  angVar  │
+        ├──────────┴──────────┤
+        │  flow arrows (full) │
+        ├──────────┬──────────┤
+        │     P    │  status  │
         ├──────────┴──────────┤
         │  P(t) live timeline │
         └─────────────────────┘
@@ -710,9 +711,9 @@ def _build_dashboard(
         rho_pane = fr.copy()
         _label(rho_pane, "rho  (n/a)")
 
-    # Row 2 — |u| (with arrows) + Var(u)
+    # Row 2 — |u| speed heatmap (left) + angVar (right)
     if u_np is not None:
-        # Apply head mask to visualization so arrows/heatmap only show where people are.
+        # Apply head mask so heatmaps only show where people are.
         if head_mask is not None:
             mh, mw = u_np.shape[1], u_np.shape[2]
             m = head_mask if head_mask.shape == (mh, mw) else cv2.resize(
@@ -724,10 +725,8 @@ def _build_dashboard(
         u_mag = np.sqrt(u_vis[0] ** 2 + u_vis[1] ** 2)
         u_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_COOL,
                                   alpha=0.45, vmin=0.0)
-        u_pane = _flow_arrows(u_pane, u_vis, step=24, scale=1.0)
         _label(u_pane, f"|u|  max={u_mag.max():.2f} px/frame")
 
-        # Angular variance panel — directional chaos heatmap
         if ang_var_np is not None:
             var_pane = _heatmap_overlay(fr, ang_var_np, cmap=cv2.COLORMAP_PLASMA,
                                         alpha=0.55, vmin=0.0, vmax=1.0)
@@ -735,11 +734,22 @@ def _build_dashboard(
         else:
             var_pane = fr.copy()
             _label(var_pane, "angVar  (need 2 frames)")
-    else:
-        u_pane = fr.copy(); _label(u_pane, "|u|  (need 2 frames)")
-        var_pane = fr.copy(); _label(var_pane, "angVar  (need 2 frames)")
 
-    # Row 3 — P + status
+        # Row 3 — full-width flow arrows on a clean copy of the frame so
+        # arrows are visible without a heatmap competing for attention.
+        full_w = pane_w * 2  # match the two-column width above
+        fr_wide = cv2.resize(frame_bgr, (full_w, pane_h))
+        arrows_pane = _flow_arrows(fr_wide, u_vis, step=32, scale=1.0)
+        _label(arrows_pane, "flow arrows (RAFT)")
+    else:
+        u_pane = fr.copy();    _label(u_pane,    "|u|  (need 2 frames)")
+        var_pane = fr.copy();  _label(var_pane,  "angVar  (need 2 frames)")
+        full_w = pane_w * 2
+        fr_wide = cv2.resize(frame_bgr, (full_w, pane_h))
+        arrows_pane = fr_wide.copy()
+        _label(arrows_pane, "flow arrows  (need 2 frames)")
+
+    # Row 4 — P + status
     if P_np is not None:
         P_pane = _heatmap_overlay(fr, P_np, cmap=cv2.COLORMAP_TURBO,
                                   alpha=0.55, vmin=0.0)
@@ -768,8 +778,9 @@ def _build_dashboard(
 
     row1 = np.hstack([input_pane, rho_pane])
     row2 = np.hstack([u_pane,     var_pane])
-    row3 = np.hstack([P_pane,     status])
-    grid = np.vstack([row1, row2, row3])
+    row3 = arrows_pane                        # full-width
+    row4 = np.hstack([P_pane,     status])
+    grid = np.vstack([row1, row2, row3, row4])
 
     timeline = _render_timeline_strip(history, threshold,
                                       width=grid.shape[1], height=180)
