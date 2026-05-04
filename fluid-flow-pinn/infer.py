@@ -230,7 +230,7 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
 def _local_angular_var_np(
     u_np: np.ndarray,
     k: int = 5,
-    min_speed: float = 0.1,
+    person_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Magnitude-weighted circular variance of flow directions.
 
@@ -243,21 +243,28 @@ def _local_angular_var_np(
         R = |mean(speed * e^{iθ})| / mean(speed)   (resultant vector length)
         circular_var = 1 - R                         → 0=aligned, 1=chaos
 
-    Pixels where |u| < min_speed are excluded from the local window so stationary background noise doesn't pollute the signal. The result is masked back to zero at those pixels.
+    person_mask: float32 (H, W) binary 0/1 at the same resolution as u_np.
+                 Only pixels where person_mask=1 contribute to local window
+                 statistics and receive a non-zero output. This is the same
+                 YOLO/lwcc detection mask already multiplied into u_np — using
+                 it here means variance is only computed where humans are
+                 detected, not inferred from speed thresholds.
+                 When None, all pixels with non-zero flow are included.
 
-    u_np       : (2, H, W) — should already be masked before calling so background pixels outside the crowd are zeroed.
-    k          : local window side length (must be odd; cv2.blur uses box filter)
-    min_speed  : pixels slower than this threshold are treated as stationary and excluded from the directional disorder estimate.
+    u_np: (2, H, W) — should already be masked (u_np * mask) before calling.
     Returns (H, W) float32 in [0, 1].
     """
     ux = u_np[0].astype(np.float32)
     uy = u_np[1].astype(np.float32)
     speed = np.sqrt(ux ** 2 + uy ** 2)
 
-    # Only include pixels with meaningful motion
-    valid = (speed > min_speed).astype(np.float32)
+    # valid = pixels that should contribute to local window statistics
+    if person_mask is not None:
+        valid = person_mask.astype(np.float32)
+    else:
+        valid = (speed > 0.0).astype(np.float32)
 
-    # Unit vector components, zeroed where speed is too low
+    # Unit vector components, zeroed outside valid region
     safe_speed = np.where(valid > 0, speed, 1.0)
     cos_theta = np.where(valid > 0, ux / safe_speed, 0.0).astype(np.float32)
     sin_theta = np.where(valid > 0, uy / safe_speed, 0.0).astype(np.float32)
@@ -267,19 +274,17 @@ def _local_angular_var_np(
     wsin = (speed * sin_theta).astype(np.float32)
 
     kernel = (k, k)
-    # Local sums of weighted direction components and total weight
-    sum_wcos  = cv2.blur(wcos,  kernel) * (k * k)
-    sum_wsin  = cv2.blur(wsin,  kernel) * (k * k)
-    sum_w     = cv2.blur(speed, kernel) * (k * k)
+    sum_wcos = cv2.blur(wcos,  kernel) * (k * k)
+    sum_wsin = cv2.blur(wsin,  kernel) * (k * k)
+    sum_w    = cv2.blur(speed, kernel) * (k * k)
 
     # Resultant vector length R ∈ [0, 1]: 1=all aligned, 0=all opposing
     R = np.sqrt(sum_wcos ** 2 + sum_wsin ** 2) / (sum_w + 1e-8)
     R = np.clip(R, 0.0, 1.0)
     circ_var = 1.0 - R  # 0=coherent, 1=chaotic
 
-    # Zero out pixels where nobody is moving — don't report chaos in still areas
-    has_motion = (cv2.blur(valid, kernel) * (k * k)) > 0
-    circ_var = np.where(has_motion, circ_var, 0.0).astype(np.float32)
+    # Only report chaos where humans are detected
+    circ_var = (circ_var * valid).astype(np.float32)
     return circ_var
 
 
@@ -525,7 +530,9 @@ def _compute_pressure_np(
     var_kernel: side length of the local window for angular variance (must be odd).
     When rho_np is None, only the speed + variance terms are computed.
     """
-    # Gate flow to mask region FIRST — all downstream terms use masked u_np
+    # Gate flow to mask region FIRST — all downstream terms use masked u_np.
+    # Also keep the resolved mask (m) to pass into angular variance so it uses detection pixels as the valid set, not a speed threshold.
+    m: Optional[np.ndarray] = None
     if mask is not None:
         mh, mw = u_np.shape[1], u_np.shape[2]
         m = mask if mask.shape == (mh, mw) else cv2.resize(
@@ -537,11 +544,11 @@ def _compute_pressure_np(
     u_max = float(u_mag.max())
     speed_term = u_mag / (u_max + 1e-8)  # normalise to [0, 1]
 
-    # γ term — magnitude-weighted circular variance (directional + speed chaos)
-    # Computed on the already-masked u_np so background pixels don't corrupt
-    # the local window statistics near crowd boundaries.
+    # γ term — magnitude-weighted circular variance restricted to detected persons.
+    # person_mask=m means only pixels where YOLO/lwcc detected a human contribute
+    # to the local window statistics, replacing the old speed-threshold heuristic.
     if p_gamma > 0.0:
-        ang_var = _local_angular_var_np(u_np, k=var_kernel)  # already in [0, 1]
+        ang_var = _local_angular_var_np(u_np, k=var_kernel, person_mask=m)
     else:
         ang_var = None
 
