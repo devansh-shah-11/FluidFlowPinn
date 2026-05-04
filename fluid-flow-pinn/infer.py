@@ -213,6 +213,9 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     """Per-pixel local variance of a 2-channel flow field (matches PressureMap).
 
     u_np: (2, H, W). Returns (H, W).
+    NOTE: This is Cartesian variance averaged over x/y components. It is
+    sensitive to speed variance but not purely to directional chaos — kept for
+    reference. Use _local_angular_var_np for a direction+speed disorder signal.
     """
     ux, uy = u_np[0].astype(np.float32), u_np[1].astype(np.float32)
     kernel = (k, k)
@@ -222,6 +225,62 @@ def _local_var_np(u_np: np.ndarray, k: int = 5) -> np.ndarray:
     Ex2_y = cv2.blur(uy * uy, kernel)
     var = ((Ex2_x - Ex_x ** 2) + (Ex2_y - Ex_y ** 2)) / 2.0
     return np.clip(var, 0.0, None)
+
+
+def _local_angular_var_np(
+    u_np: np.ndarray,
+    k: int = 5,
+    min_speed: float = 0.1,
+) -> np.ndarray:
+    """Magnitude-weighted circular variance of flow directions.
+
+    Captures directional chaos regardless of whether it comes from speed differences or angle differences:
+      - Half crowd running right, half running left  → high (pure direction)
+      - Crowd running in a swirl / turbulent pattern → high
+      - Orderly fast stampede in one direction       → low (even if β is high)
+
+    Uses circular statistics so angles wrap correctly (±π = same direction):
+        R = |mean(speed * e^{iθ})| / mean(speed)   (resultant vector length)
+        circular_var = 1 - R                         → 0=aligned, 1=chaos
+
+    Pixels where |u| < min_speed are excluded from the local window so stationary background noise doesn't pollute the signal. The result is masked back to zero at those pixels.
+
+    u_np       : (2, H, W) — should already be masked before calling so background pixels outside the crowd are zeroed.
+    k          : local window side length (must be odd; cv2.blur uses box filter)
+    min_speed  : pixels slower than this threshold are treated as stationary and excluded from the directional disorder estimate.
+    Returns (H, W) float32 in [0, 1].
+    """
+    ux = u_np[0].astype(np.float32)
+    uy = u_np[1].astype(np.float32)
+    speed = np.sqrt(ux ** 2 + uy ** 2)
+
+    # Only include pixels with meaningful motion
+    valid = (speed > min_speed).astype(np.float32)
+
+    # Unit vector components, zeroed where speed is too low
+    safe_speed = np.where(valid > 0, speed, 1.0)
+    cos_theta = np.where(valid > 0, ux / safe_speed, 0.0).astype(np.float32)
+    sin_theta = np.where(valid > 0, uy / safe_speed, 0.0).astype(np.float32)
+
+    # Weight unit vectors by speed so fast-moving disagreements count more
+    wcos = (speed * cos_theta).astype(np.float32)
+    wsin = (speed * sin_theta).astype(np.float32)
+
+    kernel = (k, k)
+    # Local sums of weighted direction components and total weight
+    sum_wcos  = cv2.blur(wcos,  kernel) * (k * k)
+    sum_wsin  = cv2.blur(wsin,  kernel) * (k * k)
+    sum_w     = cv2.blur(speed, kernel) * (k * k)
+
+    # Resultant vector length R ∈ [0, 1]: 1=all aligned, 0=all opposing
+    R = np.sqrt(sum_wcos ** 2 + sum_wsin ** 2) / (sum_w + 1e-8)
+    R = np.clip(R, 0.0, 1.0)
+    circ_var = 1.0 - R  # 0=coherent, 1=chaotic
+
+    # Zero out pixels where nobody is moving — don't report chaos in still areas
+    has_motion = (cv2.blur(valid, kernel) * (k * k)) > 0
+    circ_var = np.where(has_motion, circ_var, 0.0).astype(np.float32)
+    return circ_var
 
 
 def _load_lwcc(model_name: Optional[str], model_weights: str, device: torch.device):
@@ -444,47 +503,70 @@ def _compute_pressure_np(
     u_np: np.ndarray,
     p_alpha: float = 1.0,
     p_beta: float = 1.0,
+    p_gamma: float = 1.0,
     mask: Optional[np.ndarray] = None,
+    var_kernel: int = 5,
 ) -> np.ndarray:
-    """Compute crowd pressure as P = α*(N/area) + β*mean_speed_in_boxes.
+    """Compute crowd pressure as P = α*density + β*speed + γ*directional_chaos.
 
-    Two independently weighted terms capture both stampede conditions:
-      - dense static crush  : high N/area  → α term dominates
-      - fast-moving stampede: high |u|     → β term dominates
+    Three independently weighted terms:
+      - dense static crush       : high density  → α term dominates
+      - fast-moving stampede     : high |u|      → β term dominates
+      - chaotic / panic motion   : high angular  → γ term dominates
+                                   variance (crowd running in all directions)
 
-    Both terms are normalised to [0, 1] per-frame before weighting so α and β
-    are directly comparable regardless of absolute magnitude.
+    All terms are normalised to [0, 1] per-frame before weighting.
 
-    mask: float32 (H', W') binary 0/1 array. Flow outside the mask is zeroed so
-          background motion doesn't pollute the speed term.
-    When rho_np is None, only the speed term is computed (α has no effect).
+    mask: float32 (H', W') binary 0/1 array. Applied FIRST so that background
+          pixels are zeroed before any statistics (speed, variance) are computed.
+          This prevents off-crowd motion (camera shake, trees) from bleeding into
+          crowd-region variance estimates through the local window.
+
+    var_kernel: side length of the local window for angular variance (must be odd).
+    When rho_np is None, only the speed + variance terms are computed.
     """
-    # Gate flow to mask region
+    # Gate flow to mask region FIRST — all downstream terms use masked u_np
     if mask is not None:
         mh, mw = u_np.shape[1], u_np.shape[2]
         m = mask if mask.shape == (mh, mw) else cv2.resize(
             mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
         u_np = u_np * m[np.newaxis, :, :]
 
-    # β term — per-pixel flow speed
+    # β term — per-pixel flow speed (computed on masked field)
     u_mag = np.sqrt(u_np[0] ** 2 + u_np[1] ** 2)  # (Hf, Wf)
     u_max = float(u_mag.max())
     speed_term = u_mag / (u_max + 1e-8)  # normalise to [0, 1]
 
-    if rho_np is None:
-        return speed_term
+    # γ term — magnitude-weighted circular variance (directional + speed chaos)
+    # Computed on the already-masked u_np so background pixels don't corrupt
+    # the local window statistics near crowd boundaries.
+    if p_gamma > 0.0:
+        ang_var = _local_angular_var_np(u_np, k=var_kernel)  # already in [0, 1]
+    else:
+        ang_var = None
 
-    # Resize speed term to rho grid if needed
+    if rho_np is None:
+        result = speed_term
+        if ang_var is not None:
+            result = result + p_gamma * ang_var
+        return result
+
+    # Resize flow-grid terms to rho grid if needed
     h, w = rho_np.shape[-2:]
     if speed_term.shape != (h, w):
         speed_term = cv2.resize(speed_term, (w, h), interpolation=cv2.INTER_LINEAR)
+    if ang_var is not None and ang_var.shape != (h, w):
+        ang_var = cv2.resize(ang_var, (w, h), interpolation=cv2.INTER_LINEAR)
 
     # α term — local density (rho already integrates to N, values in [0, ~2+])
     rho = rho_np.astype(np.float32)
     rho_max = float(rho.max())
     density_term = rho / (rho_max + 1e-8)  # normalise to [0, 1]
 
-    return p_alpha * density_term + p_beta * speed_term
+    result = p_alpha * density_term + p_beta * speed_term
+    if ang_var is not None:
+        result = result + p_gamma * ang_var
+    return result
 
 
 def _flow_arrows(
@@ -715,8 +797,12 @@ def run(args: argparse.Namespace) -> None:
     mask_suffix = "[mask]" if _masked else ""
     if lwcc_model is None and yolo_model is None:
         p_formula = f"speed{mask_suffix}"
+        if args.p_gamma > 0.0:
+            p_formula += f" + γ*angVar{mask_suffix}"
     else:
         p_formula = f"α*{rho_tag} + β*speed{mask_suffix}"
+        if args.p_gamma > 0.0:
+            p_formula += f" + γ*angVar{mask_suffix}"
 
     history_len = max(60, int(src.fps * 10)) if src.fps > 0 else 300
     history: deque[float] = deque(maxlen=history_len)
@@ -835,7 +921,9 @@ def run(args: argparse.Namespace) -> None:
                     rho_np, u_np,
                     p_alpha=args.p_alpha,
                     p_beta=args.p_beta,
+                    p_gamma=args.p_gamma,
                     mask=head_mask,
+                    var_kernel=args.var_kernel,
                 )
 
                 p_max = _aggregate_pressure(
@@ -934,11 +1022,18 @@ def _parse_args() -> argparse.Namespace:
                    help="Inference height — frames are resized to this (must be /8)")
     # Fix #1 — decouple ρ and Var(u) in the danger score
     p.add_argument("--p-alpha", type=float, default=1.0,
-                   help="Weight for the density term in P = α*(N/area) + β*speed. "
+                   help="Weight for the density term in P = α*(N/area) + β*speed + γ*angVar. "
                         "Increase to make dense crowds dominate the score (default 1.0).")
     p.add_argument("--p-beta",  type=float, default=1.0,
-                   help="Weight for the speed term in P = α*(N/area) + β*speed. "
+                   help="Weight for the speed term in P = α*(N/area) + β*speed + γ*angVar. "
                         "Increase to make fast-moving crowds dominate the score (default 1.0).")
+    p.add_argument("--p-gamma", type=float, default=1.0,
+                   help="Weight for the directional-chaos term (magnitude-weighted circular "
+                        "variance). 0 disables (default). Try 0.5..1.0 to penalise crowds "
+                        "running in conflicting directions even at moderate speed.")
+    p.add_argument("--var-kernel", type=int, default=5,
+                   help="Local window size (pixels, odd) for angular variance (default 5). "
+                        "Larger = smoother but less spatially precise.")
     # Aggregator — how to reduce P-map to a scalar danger score
     p.add_argument("--p-agg", choices=("max", "topk", "weighted_mean"),
                    default="max",
