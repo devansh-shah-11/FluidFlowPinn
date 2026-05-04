@@ -201,7 +201,7 @@ def _heatmap_overlay(
 ) -> np.ndarray:
     """Upsample `field` (H',W') to frame size, color-map, blend on top of frame."""
     h, w = frame_bgr.shape[:2]
-    f = field.astype(np.float32)
+    f = np.nan_to_num(field.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     if vmin is None: vmin = float(f.min())
     if vmax is None: vmax = float(f.max())
     if vmax - vmin < 1e-8:
@@ -276,10 +276,12 @@ def _local_angular_var_np(
     else:
         valid = (speed > 0.0).astype(np.float32)
 
-    # Unit vector components, zeroed outside valid region
-    safe_speed = np.where(valid > 0, speed, 1.0)
-    cos_theta = np.where(valid > 0, ux / safe_speed, 0.0).astype(np.float32)
-    sin_theta = np.where(valid > 0, uy / safe_speed, 0.0).astype(np.float32)
+    # Unit vector components, zeroed outside valid region.
+    # safe_speed guards against division by zero for any pixel (including valid
+    # ones where a detected person is stationary and speed == 0).
+    safe_speed = np.maximum(speed, 1e-6)
+    cos_theta = (np.where(valid > 0, ux / safe_speed, 0.0)).astype(np.float32)
+    sin_theta = (np.where(valid > 0, uy / safe_speed, 0.0)).astype(np.float32)
 
     # Weight unit vectors by speed so fast-moving disagreements count more
     wcos = (speed * cos_theta).astype(np.float32)
