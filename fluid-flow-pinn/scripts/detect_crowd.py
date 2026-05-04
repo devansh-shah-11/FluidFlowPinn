@@ -110,12 +110,73 @@ def run_lwcc(image_path: Path, model_name: str, model_weights: str, out_path: Pa
     print(f"[lwcc:{model_name}/{model_weights}] count={count:.2f} → {out_path}")
 
 
+def _extract_csrnet_state(weights: str) -> dict:
+    """Return a CSRNet-compatible state_dict from either a standalone CSRNet
+    checkpoint or a full FluidFlowPINN checkpoint (where weights are nested
+    under `density_branch.`)."""
+    state = torch.load(weights, map_location="cpu", weights_only=False)
+    if isinstance(state, dict):
+        for wrap_key in ("model", "state_dict", "model_state_dict"):
+            if wrap_key in state and isinstance(state[wrap_key], dict):
+                state = state[wrap_key]
+                break
+    if any(k.startswith("density_branch.") for k in state.keys()):
+        state = {k[len("density_branch."):]: v
+                 for k, v in state.items() if k.startswith("density_branch.")}
+        print(f"[csrnet] Detected PINN checkpoint — extracted {len(state)} density_branch keys.")
+    return state
+
+
+def _build_pinn_csrnet() -> "torch.nn.Module":
+    """Truncated CSRNet variant used by FluidFlowPINN's density branch.
+    Frontend stops at conv3_3 (256ch, 1/8 res); backend 256→512→512→512→256→128→64;
+    output named `density_head` (not `output_layer`)."""
+    import torch.nn as nn
+    from torchvision import models as tvm
+
+    vgg = tvm.vgg16(weights=None)
+    frontend = nn.Sequential(*list(vgg.features.children())[:16])  # through conv3_3+ReLU
+
+    backend_cfg = [(512, 256), (512, 512), (512, 512), (256, 512), (128, 256), (64, 128)]
+    backend_layers = []
+    for out_ch, in_ch in backend_cfg:
+        backend_layers += [
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=2, dilation=2),
+            nn.ReLU(inplace=True),
+        ]
+    backend = nn.Sequential(*backend_layers)
+    density_head = nn.Conv2d(64, 1, kernel_size=1)
+
+    class _PINNCSRNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frontend = frontend
+            self.backend = backend
+            self.density_head = density_head
+
+        def forward(self, x):
+            import torch.nn.functional as F
+            return F.relu(self.density_head(self.backend(self.frontend(x))))
+
+    return _PINNCSRNet()
+
+
 def run_csrnet(image_path: Path, weights: str, out_path: Path, tau: float = 0.0) -> None:
-    from models.branch1_density import load_csrnet
+    from models.branch1_density import CSRNet
     from torchvision import transforms
 
     device = _device()
-    model = load_csrnet(weights_path=weights, pretrained_vgg=False).to(device).eval()
+    state = _extract_csrnet_state(weights)
+    # Detect truncated PINN variant (256-channel backend input) vs. canonical CSRNet (512).
+    is_pinn_variant = "backend.0.weight" in state and state["backend.0.weight"].shape[1] == 256
+    model = (_build_pinn_csrnet() if is_pinn_variant else CSRNet()).to(device).eval()
+    if is_pinn_variant:
+        print("[csrnet] Using truncated PINN density-branch architecture.")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[csrnet] missing keys: {len(missing)} (e.g. {missing[:3]})")
+    if unexpected:
+        print(f"[csrnet] unexpected keys: {len(unexpected)} (e.g. {unexpected[:3]})")
 
     bgr = cv2.imread(str(image_path))
     if bgr is None:
