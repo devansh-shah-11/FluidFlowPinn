@@ -665,6 +665,7 @@ def _build_dashboard(
     p_formula: str = "rho * Var(u)",
     head_mask: Optional[np.ndarray] = None,
     yolo_boxes: Optional[np.ndarray] = None,
+    ang_var_np: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compose the live dashboard image (BGR uint8).
 
@@ -672,7 +673,7 @@ def _build_dashboard(
         ┌──────────┬──────────┐
         │   input  │ rho      │
         ├──────────┼──────────┤
-        │  |u| +   │ Var(u)   │
+        │  |u| +   │ angVar   │
         │  arrows  │          │
         ├──────────┼──────────┤
         │   P      │ status   │
@@ -726,13 +727,17 @@ def _build_dashboard(
         u_pane = _flow_arrows(u_pane, u_vis, step=24, scale=1.0)
         _label(u_pane, f"|u|  max={u_mag.max():.2f} px/frame")
 
-        # Show speed magnitude as the second row-2 panel (replaces Var(u))
-        var_pane = _heatmap_overlay(fr, u_mag, cmap=cv2.COLORMAP_PLASMA,
-                                    alpha=0.55, vmin=0.0)
-        _label(var_pane, f"|u| heat  max={u_mag.max():.2f}")
+        # Angular variance panel — directional chaos heatmap
+        if ang_var_np is not None:
+            var_pane = _heatmap_overlay(fr, ang_var_np, cmap=cv2.COLORMAP_PLASMA,
+                                        alpha=0.55, vmin=0.0, vmax=1.0)
+            _label(var_pane, f"angVar  max={ang_var_np.max():.3f}")
+        else:
+            var_pane = fr.copy()
+            _label(var_pane, "angVar  (need 2 frames)")
     else:
         u_pane = fr.copy(); _label(u_pane, "|u|  (need 2 frames)")
-        var_pane = fr.copy(); _label(var_pane, "|u| heat  (need 2 frames)")
+        var_pane = fr.copy(); _label(var_pane, "angVar  (need 2 frames)")
 
     # Row 3 — P + status
     if P_np is not None:
@@ -886,11 +891,12 @@ def run(args: argparse.Namespace) -> None:
             frame_resized = cv2.resize(frame, (inf_w, inf_h))
             cur_tensor = _bgr_to_tensor(frame_resized, device)
 
-            rho_np:    Optional[np.ndarray] = None
-            u_np:      Optional[np.ndarray] = None
-            P_np:      Optional[np.ndarray] = None
-            p_max:     Optional[float] = None
-            head_mask: Optional[np.ndarray] = None
+            rho_np:     Optional[np.ndarray] = None
+            u_np:       Optional[np.ndarray] = None
+            P_np:       Optional[np.ndarray] = None
+            ang_var_np: Optional[np.ndarray] = None
+            p_max:      Optional[float] = None
+            head_mask:  Optional[np.ndarray] = None
             yolo_boxes: Optional[np.ndarray] = None
 
             if prev_tensor is not None:
@@ -949,6 +955,18 @@ def run(args: argparse.Namespace) -> None:
                     var_kernel=args.var_kernel,
                 )
 
+                # Compute angular variance for visualization regardless of p_gamma
+                # so the panel is always shown when flow is available.
+                _m_vis: Optional[np.ndarray] = None
+                if head_mask is not None:
+                    mh, mw = u_np.shape[1], u_np.shape[2]
+                    _m_vis = head_mask if head_mask.shape == (mh, mw) else cv2.resize(
+                        head_mask, (mw, mh), interpolation=cv2.INTER_NEAREST)
+                ang_var_np: Optional[np.ndarray] = _local_angular_var_np(
+                    u_np * (_m_vis[np.newaxis] if _m_vis is not None else 1.0),
+                    k=args.var_kernel, person_mask=_m_vis,
+                )
+
                 p_max = _aggregate_pressure(
                     P_np, rho_np, mode=args.p_agg, topk_frac=args.topk_frac,
                 )
@@ -968,6 +986,7 @@ def run(args: argparse.Namespace) -> None:
                 display_frame, rho_np, u_np, P_np, history, threshold,
                 fps_actual, frame_idx, p_max, p_formula=p_formula,
                 head_mask=head_mask, yolo_boxes=yolo_boxes,
+                ang_var_np=ang_var_np,
             )
 
             if out_dir and writer is None:
