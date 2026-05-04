@@ -125,12 +125,17 @@ def _load_model(
     checkpoint_path: Optional[Path],
     device: torch.device,
     raft_iters: int = 6,
+    raft_weights: Optional[Path] = None,
+    raft_variant: str = "small",
 ) -> tuple:
     """Load RAFT flow branch only — density is handled by lwcc externally.
 
       • `checkpoint_path` given: extract RAFT weights from a full training
         checkpoint (best.pt) so we don't waste time loading CSRNet.
-      • None: load torchvision-pretrained RAFT directly.
+      • `raft_weights` given: load a standalone RAFT .pth (e.g. a fine-tuned
+        crowdflow checkpoint). DataParallel "module.*" prefixes are remapped
+        automatically in load_raft.
+      • Neither: load torchvision-pretrained RAFT-Small weights.
 
     Returns (flow_branch, cfg, use_fp16) — flow_branch is a RAFTFlow module.
     """
@@ -159,9 +164,16 @@ def _load_model(
         return flow_branch, cfg, use_fp16
 
     cfg = {}
-    log.info("Loading torchvision-pretrained RAFT | device=%s fp16=%s iters=%d",
-             device, use_fp16, raft_iters)
-    flow_branch = load_raft(frozen=True, num_flow_updates=raft_iters).to(device)
+    if raft_weights is not None:
+        log.info("Loading fine-tuned RAFT-%s weights: %s | device=%s fp16=%s iters=%d",
+                 raft_variant, raft_weights, device, use_fp16, raft_iters)
+        flow_branch = load_raft(weights_path=raft_weights, frozen=True,
+                                num_flow_updates=raft_iters, variant=raft_variant).to(device)
+    else:
+        log.info("Loading torchvision-pretrained RAFT-%s | device=%s fp16=%s iters=%d",
+                 raft_variant, device, use_fp16, raft_iters)
+        flow_branch = load_raft(frozen=True, num_flow_updates=raft_iters,
+                                variant=raft_variant).to(device)
     flow_branch.eval()
     log.info("RAFT ready.")
     return flow_branch, cfg, use_fp16
@@ -764,7 +776,9 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Using device: %s", device)
     ckpt = Path(args.checkpoint) if args.checkpoint else None
-    model, cfg, use_fp16 = _load_model(ckpt, device, raft_iters=args.raft_iters)
+    raft_w = Path(args.raft_weights) if args.raft_weights else None
+    model, cfg, use_fp16 = _load_model(ckpt, device, raft_iters=args.raft_iters,
+                                        raft_weights=raft_w, raft_variant=args.raft_variant)
 
     # Apply --no-lwcc override before loading
     if args.no_lwcc:
@@ -1015,6 +1029,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", default=None,
                    help="Path to a full training checkpoint .pt (best.pt). "
                         "Omit to run with torchvision-pretrained RAFT + lwcc density.")
+    p.add_argument("--raft-weights", default=None,
+                   help="Path to a standalone fine-tuned RAFT .pth (e.g. raft_crowdflow_sintel_ft_best.pth). Ignored when --checkpoint is set. DataParallel 'module.*' prefixes are remapped automatically.")
+    p.add_argument("--raft-variant", choices=("small", "large"), default="small",
+                   help="RAFT architecture variant (default: small). Use 'large' "
+                        "for the crowdflow fine-tuned checkpoint.")
     p.add_argument("--source",     required=True,
                    help="Video file path, image path, or webcam index (e.g. 0)")
     p.add_argument("--out-dir",    default=None,
