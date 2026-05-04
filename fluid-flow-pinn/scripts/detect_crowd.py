@@ -33,14 +33,28 @@ def _device() -> torch.device:
     return torch.device("cpu")
 
 
-def _overlay_heatmap(bgr: np.ndarray, density: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+def _overlay_heatmap(
+    bgr: np.ndarray,
+    density: np.ndarray,
+    alpha: float = 0.5,
+    tau: float = 0.0,
+) -> np.ndarray:
     H, W = bgr.shape[:2]
     if density.shape != (H, W):
         density = cv2.resize(density, (W, H), interpolation=cv2.INTER_LINEAR)
-    d = density - density.min()
+    d = np.clip(density, 0.0, None)
     d = d / (d.max() + 1e-8)
     heat = cv2.applyColorMap((d * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    return cv2.addWeighted(bgr, 1.0 - alpha, heat, alpha, 0.0)
+    # Per-pixel blend: only tint where density is non-negligible. Gamma 0.5
+    # lifts mid-range values so faint heads remain visible without flooding
+    # the background with JET's blue floor.
+    w = (d ** 0.5)[..., None] * alpha
+    vis = (bgr.astype(np.float32) * (1.0 - w) + heat.astype(np.float32) * w).astype(np.uint8)
+    if tau > 0.0:
+        mask = (density > tau).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours, -1, (255, 255, 255), 1)
+    return vis
 
 
 def run_yolo(image_path: Path, weights: str, out_path: Path, conf: float) -> None:
@@ -69,7 +83,7 @@ def run_yolo(image_path: Path, weights: str, out_path: Path, conf: float) -> Non
     print(f"[yolo] {len(person_xyxy)} person(s) → {out_path}")
 
 
-def run_lwcc(image_path: Path, model_name: str, model_weights: str, out_path: Path) -> None:
+def run_lwcc(image_path: Path, model_name: str, model_weights: str, out_path: Path, tau: float = 0.0) -> None:
     from lwcc.LWCC import load_model
     from lwcc.util.functions import load_image as lwcc_load_image
 
@@ -85,14 +99,15 @@ def run_lwcc(image_path: Path, model_name: str, model_weights: str, out_path: Pa
     count = float(density.sum())
 
     bgr = cv2.imread(str(image_path))
-    vis = _overlay_heatmap(bgr, density)
-    cv2.putText(vis, f"count: {count:.1f}", (10, 25),
+    vis = _overlay_heatmap(bgr, density, tau=tau)
+    label = f"count: {count:.1f}" + (f"  tau>{tau}" if tau > 0 else "")
+    cv2.putText(vis, label, (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), vis)
     print(f"[lwcc:{model_name}/{model_weights}] count={count:.2f} → {out_path}")
 
 
-def run_csrnet(image_path: Path, weights: str, out_path: Path) -> None:
+def run_csrnet(image_path: Path, weights: str, out_path: Path, tau: float = 0.0) -> None:
     from models.branch1_density import load_csrnet
     from torchvision import transforms
 
@@ -117,8 +132,9 @@ def run_csrnet(image_path: Path, weights: str, out_path: Path) -> None:
     density = rho[0, 0].cpu().numpy().astype(np.float32)
     count = float(density.sum())
 
-    vis = _overlay_heatmap(bgr, density)
-    cv2.putText(vis, f"count: {count:.1f}", (10, 25),
+    vis = _overlay_heatmap(bgr, density, tau=tau)
+    label = f"count: {count:.1f}" + (f"  tau>{tau}" if tau > 0 else "")
+    cv2.putText(vis, label, (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), vis)
     print(f"[csrnet] count={count:.2f} → {out_path}")
@@ -137,6 +153,9 @@ def main() -> None:
     ap.add_argument("--lwcc-weights", default="SHA",
                     help="lwcc weights tag (SHA, SHB, QNRF)")
     ap.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    ap.add_argument("--tau", type=float, default=0.0,
+                    help="Density threshold for lwcc/csrnet (matches infer.py --density-mask-tau). "
+                         "When >0, draws contours where rho>tau on the heatmap.")
     args = ap.parse_args()
 
     if not args.image.exists():
@@ -148,10 +167,10 @@ def main() -> None:
         weights = args.weights or str(REPO_ROOT / "yolo26n.pt")
         run_yolo(args.image, weights, out_path, args.conf)
     elif args.model == "lwcc":
-        run_lwcc(args.image, args.lwcc_model, args.lwcc_weights, out_path)
+        run_lwcc(args.image, args.lwcc_model, args.lwcc_weights, out_path, tau=args.tau)
     elif args.model == "csrnet":
         weights = args.weights or str(REPO_ROOT.parent / "PartAmodel_best.pth")
-        run_csrnet(args.image, weights, out_path)
+        run_csrnet(args.image, weights, out_path, tau=args.tau)
 
 
 if __name__ == "__main__":
