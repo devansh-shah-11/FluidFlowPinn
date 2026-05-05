@@ -138,6 +138,7 @@ def main(args: argparse.Namespace) -> None:
         if pooled["threshold_best"] == pooled["threshold_best"]:  # not nan
             ax.axhline(pooled["threshold_best"], color="green",
                        linestyle="--", lw=1, label=f"τ*={pooled['threshold_best']:.2f}")
+        ax.axhline(3.0, color="red", linestyle=":", lw=1.5, label="τ=3.0 (anomaly)")
         ax.set_title(scene, fontsize=9); ax.tick_params(labelsize=7)
         ax.grid(alpha=0.3)
     for ax in axes.flat[len(by_scene):]:
