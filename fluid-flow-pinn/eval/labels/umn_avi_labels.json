@@ -1,0 +1,13 @@
+{
+  "_doc": "Hand-labeled anomaly windows for the concatenated UMN 'Crowd-Activity-All.avi' file (30 fps). Frame indices are absolute in the single AVI. Inclusive start, exclusive end.",
+  "_source": "Annotated by author by scrubbing the video.",
+  "video": "Test Images/Crowd-Activity-All.avi",
+  "fps": 30,
+  "windows": [
+    {"scene": 1, "start_s": 16, "end_s": 19, "start_frame": 480,  "end_frame": 570},
+    {"scene": 2, "start_s": 42, "end_s": 46, "start_frame": 1260, "end_frame": 1380},
+    {"scene": 3, "start_s": 58, "end_s": 62, "start_frame": 1740, "end_frame": 1860},
+    {"scene": 4, "start_s": 85, "end_s": 88, "start_frame": 2550, "end_frame": 2640}
+  ],
+  "max_frame_labeled": 2640
+}

@@ -60,6 +60,34 @@ def _iter_umn(umn_root: Path) -> Iterator[Tuple[str, int, np.ndarray]]:
         cap.release()
 
 
+def _iter_single_avi(avi_path: Path) -> Iterator[Tuple[str, int, np.ndarray]]:
+    """Yield ('all', frame_idx, bgr) for every frame of one AVI file."""
+    cap = cv2.VideoCapture(str(avi_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(avi_path)
+    i = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        yield "all", i, frame
+        i += 1
+    cap.release()
+
+
+def _umn_avi_labels(labels_json: Path) -> list[tuple[int, int]]:
+    with open(labels_json) as f:
+        d = json.load(f)
+    return [(int(w["start_frame"]), int(w["end_frame"])) for w in d["windows"]]
+
+
+def _label_in_windows(frame_idx: int, windows: list[tuple[int, int]]) -> int:
+    for s, e in windows:
+        if s <= frame_idx < e:
+            return 1
+    return 0
+
+
 def _iter_ucsd(ucsd_test_root: Path) -> Iterator[Tuple[str, int, np.ndarray]]:
     """Yield (clip_name, frame_idx, bgr_frame) for every UCSD test clip."""
     clips = sorted([d for d in ucsd_test_root.iterdir()
@@ -127,9 +155,20 @@ def run(args: argparse.Namespace) -> None:
 
     # Pick frame iterator + label table
     umn_tbl = ucsd_tbl = None
+    avi_windows: list[tuple[int, int]] | None = None
+    avi_max_frame: int | None = None
     if args.dataset == "umn":
         umn_tbl = _umn_labels(Path(args.umn_labels_json))
         frame_iter = _iter_umn(Path(args.umn_path))
+    elif args.dataset == "umn_avi":
+        if not args.umn_avi_path:
+            raise SystemExit("--umn-avi-path required for --dataset umn_avi")
+        labels_path = Path(args.umn_avi_labels_json)
+        with open(labels_path) as f:
+            ldoc = json.load(f)
+        avi_windows = [(int(w["start_frame"]), int(w["end_frame"])) for w in ldoc["windows"]]
+        avi_max_frame = int(ldoc.get("max_frame_labeled", 0)) or None
+        frame_iter = _iter_single_avi(Path(args.umn_avi_path))
     else:
         from eval.labels.ucsd_labels import load_ucsd_labels
         ucsd_tbl = load_ucsd_labels(Path(args.ucsd_path))
@@ -157,7 +196,12 @@ def run(args: argparse.Namespace) -> None:
             res = pipe.process(bgr_resized)
             if res["p_max"] is None:
                 continue  # first frame of each scene has no flow
-            label = _label_for(args.dataset, scene, frame_idx, umn_tbl, ucsd_tbl)
+            if args.dataset == "umn_avi":
+                if avi_max_frame is not None and frame_idx > avi_max_frame:
+                    break
+                label = _label_in_windows(frame_idx, avi_windows)
+            else:
+                label = _label_for(args.dataset, scene, frame_idx, umn_tbl, ucsd_tbl)
             w.writerow([scene, frame_idx, f"{res['p_max']:.6f}", label])
             rows_written += 1
             if rows_written % 200 == 0:
@@ -169,10 +213,14 @@ def run(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Score frames of a labeled video dataset")
-    p.add_argument("--dataset", choices=("umn", "ucsd"), required=True)
+    p.add_argument("--dataset", choices=("umn", "umn_avi", "ucsd"), required=True)
     p.add_argument("--umn-path",  default=str(REPO_ROOT / "data" / "umn"))
     p.add_argument("--umn-labels-json",
                    default=str(REPO_ROOT / "eval" / "labels" / "umn_labels.json"))
+    p.add_argument("--umn-avi-path", default=None,
+                   help="Path to the concatenated UMN Crowd-Activity-All.avi")
+    p.add_argument("--umn-avi-labels-json",
+                   default=str(REPO_ROOT / "eval" / "labels" / "umn_avi_labels.json"))
     p.add_argument("--ucsd-path", default=None,
                    help="UCSD Test directory (e.g. /scratch/UCSDped2/Test)")
     p.add_argument("--out-csv", default=None)
