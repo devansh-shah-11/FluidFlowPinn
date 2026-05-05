@@ -137,6 +137,8 @@ def run(args: argparse.Namespace) -> None:
     from pipeline import Pipeline, default_pipeline_args
 
     pipe_args = default_pipeline_args(
+        checkpoint=args.checkpoint,
+        raft_weights=args.raft_weights,
         raft_variant=args.raft_variant,
         raft_iters=args.raft_iters,
         lwcc_model=args.lwcc_model,
@@ -230,6 +232,11 @@ def _parse_args() -> argparse.Namespace:
     # Pipeline knobs
     p.add_argument("--raft-variant", choices=("small", "large"), default="small")
     p.add_argument("--raft-iters", type=int, default=6)
+    p.add_argument("--raft-weights", default=None,
+                   help="Path to a standalone RAFT .pth (e.g. fine-tuned weights). "
+                        "Variant must match --raft-variant.")
+    p.add_argument("--checkpoint", default=None,
+                   help="Path to a full PINN checkpoint (alternative to --raft-weights).")
     p.add_argument("--lwcc-model", default=None)
     p.add_argument("--lwcc-weights", default="SHA")
     p.add_argument("--detector", default=None)
