@@ -80,8 +80,8 @@ def run_yolo(image_path: Path, weights: str, out_path: Path, conf: float) -> Non
         cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
         cv2.putText(vis, f"{c:.2f}", (int(x1), max(0, int(y1) - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(vis, f"persons: {len(person_xyxy)}", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, f"persons: {len(person_xyxy)}", (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3, cv2.LINE_AA)
     cv2.imwrite(str(out_path), vis)
     print(f"[yolo] {len(person_xyxy)} person(s) → {out_path}")
 
@@ -104,8 +104,8 @@ def run_lwcc(image_path: Path, model_name: str, model_weights: str, out_path: Pa
     bgr = cv2.imread(str(image_path))
     vis = _overlay_heatmap(bgr, density, tau=tau)
     label = f"count: {count:.1f}" + (f"  tau>{tau}" if tau > 0 else "")
-    cv2.putText(vis, label, (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, label, (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3, cv2.LINE_AA)
     cv2.imwrite(str(out_path), vis)
     print(f"[lwcc:{model_name}/{model_weights}] count={count:.2f} → {out_path}")
 
@@ -198,8 +198,8 @@ def run_csrnet(image_path: Path, weights: str, out_path: Path, tau: float = 0.0)
 
     vis = _overlay_heatmap(bgr, density, tau=tau)
     label = f"count: {count:.1f}" + (f"  tau>{tau}" if tau > 0 else "")
-    cv2.putText(vis, label, (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, label, (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3, cv2.LINE_AA)
     cv2.imwrite(str(out_path), vis)
     print(f"[csrnet] count={count:.2f} → {out_path}")
 
